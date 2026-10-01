@@ -153,3 +153,18 @@ def test_qrc_refuses_execution():
 		qrc.sync_run(None)
 	with pytest.raises(DEFwExecutionError, match="client-executed"):
 		qrc.async_run(None)
+
+
+def test_expired_reservation_frees_components(monkeypatch, tmp_path):
+	# This QPM receives no execution calls, so the controller never closes
+	# an expired reservation on its own; the QPM must check expires_at_ns.
+	qpm = _qpm(monkeypatch, tmp_path)
+	first = qpm.reserve(request=_request("job-a"))
+	assert first["status"] == "accepted", first
+	admission = qpm.controller.admission_context
+	admission.reservations[first["reservation_id"]]["expires_at_ns"] = 1
+
+	assert "placement" not in qpm.get_reservation(
+		reservation_id=first["reservation_id"])
+	second = qpm.reserve(request=_request("job-b"))
+	assert second["status"] == "accepted", second

@@ -2,6 +2,7 @@ import copy
 import logging
 import os
 import threading
+import time
 from pathlib import Path
 
 from .matcher import Reject, capabilities, load_inventory, match, rejected
@@ -56,6 +57,16 @@ def backline_profile(device_id, max_qubits):
 		"default_ttl_ns": 60_000_000_000,
 		"max_provider_queue_depth": 1,
 	}
+
+
+def _active(reservation):
+	# The controller closes expired reservations only on the execution path,
+	# which this client-executed QPM never sees, so check the deadline here.
+	# ponytail: admission capacity of an expired, unreleased reservation is
+	# returned only when the controller next closes it; placement frees now.
+	expires_at_ns = reservation.get("expires_at_ns")
+	return reservation.get("state") == "active" and not (
+		expires_at_ns and expires_at_ns <= time.time_ns())
 
 
 class QPM(UTIL_QPM):
@@ -146,7 +157,7 @@ class QPM(UTIL_QPM):
 		reservation = super().get_reservation(
 			token=token, reservation_id=reservation_id)
 		held = self._placements.get(normalize_reservation_id(reservation_id))
-		if held is not None and reservation.get("state") == "active":
+		if held is not None and _active(reservation):
 			reservation["placement"] = copy.deepcopy(held[0])
 		return reservation
 
@@ -169,8 +180,7 @@ class QPM(UTIL_QPM):
 		# released ones are dropped here, so capacity frees lazily.
 		busy = set()
 		for rid in list(self._placements):
-			state = super().get_reservation(reservation_id=rid).get("state")
-			if state == "active":
+			if _active(super().get_reservation(reservation_id=rid)):
 				busy.update(self._placements[rid][1])
 			else:
 				self._placements.pop(rid, None)
