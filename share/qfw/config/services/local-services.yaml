@@ -60,3 +60,15 @@ services:
     device-id: fake-iqm-20q
     provider-launch:
       type: internal
+
+  - name: backline-local
+    credential-mode: no-secret
+    module: svc_backline_qpm
+    load-modules: svc_backline_qpm,api_launcher
+    agent-prefix: qpm_backline
+    target: group1-head
+    assigned-hosts: group1
+    assigned-hosts-env: QFW_QPM_ASSIGNED_HOSTS
+    device-id: backline-local
+    provider-launch:
+      type: internal
