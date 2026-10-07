@@ -48,10 +48,23 @@ class QPM(UTIL_QPM):
 		return info
 
 	def prepare_circuit(self, info):
-		# Hardware is still the IQM q20 (reached via QRMI / QDMI-on-IQM), so the
-		# qhw backend tag stays 'iqm' until per-library normalizers land.
-		info['qfw_backend'] = 'iqm'
+		# The qhw backend tag names the provider this resource belongs to, as
+		# its device-access entry declares it: iqm for the q20, aws for a
+		# Braket device. Only the simulator QPMs read the key back (to find
+		# their circuit runner), so for the shim it is provenance.
+		info['qfw_backend'] = self._provider()
 		return info
+
+	def _provider(self):
+		# Resolved once from the device-access config. Read with getattr
+		# because the mock tests build a QPM without running __init__.
+		provider = getattr(self, "_descriptor_provider", None)
+		if provider is None:
+			from .descriptor import resolve_descriptor
+			provider = str(
+				resolve_descriptor().get("provider") or "iqm").lower()
+			self._descriptor_provider = provider
+		return provider
 
 	def capability_map(self, token=None):
 		return self.qrc.capability_map()
