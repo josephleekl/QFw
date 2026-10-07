@@ -14,10 +14,33 @@ import time
 
 _DRIVER_FACTORY = {"qrmi": QrmiDriver, "qdmi": QdmiDriver}
 
+QHW_RESULT_SCHEMA = "qhw-result-v1"
+
 
 def _cancel_requested(circ):
 	cancel_event = getattr(circ, "cancel_event", None)
 	return cancel_event is not None and cancel_event.is_set()
+
+
+def _result_envelope(output):
+	# The drivers return the qhw-result-v1 record itself, and
+	# examples/measurement_support.py relies on that. The Qiskit client reads
+	# counts off the top of the result payload (qfw_job._split_result_payload)
+	# and keeps a `qhw_result` entry as metadata, which is the shape the
+	# native svc_iqm_qpm run-queue already delivers. Hoist the record into
+	# that envelope here, the one seam every shim driver passes through, so
+	# a result reads the same whichever library or provider produced it.
+	# Anything that is not a qhw record passes through untouched.
+	if not isinstance(output, dict):
+		return output
+	if output.get("schema") != QHW_RESULT_SCHEMA:
+		return output
+	result = output.get("result")
+	counts = result.get("counts") if isinstance(result, dict) else None
+	return {
+		"counts": dict(counts or {}),
+		"qhw_result": output,
+	}
 
 
 class QRC:
@@ -77,7 +100,7 @@ class QRC:
 			output = self.frontend.run_circuit(
 				circ, lib=circ.info.get("lib"))
 			circ.set_exec_done()
-			return self._result_dict(circ, output, 0)
+			return self._result_dict(circ, _result_envelope(output), 0)
 		except Exception as e:
 			circ.set_fail()
 			if raise_on_error:
