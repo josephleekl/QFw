@@ -932,8 +932,11 @@ class QPMTargetController:
 				runtime, reservation_id, require_reservation)
 
 	def register_event_endpoint(self, info):
+		reservation_id = _normalize_optional_reservation_id(
+			info.get("reservation_id"))
 		registration = dict(info)
 		registration["filters"] = dict(info.get("filters") or {})
+		registration["reservation_id"] = reservation_id
 		class_id = registration.get("class_id")
 		with self.lock:
 			self.event_endpoints.setdefault(class_id, []).append(
