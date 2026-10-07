@@ -127,13 +127,15 @@ OBJECT_STORAGE_REQUIRED = (
 # It is a number rather than a credential, so a device can set
 # job-timeout-seconds and otherwise it defaults, which is friendlier than
 # failing for the want of a value we can pick.
+JOB_TIMEOUT_SETTING = "QRMI_JOB_TIMEOUT_SECONDS"
 JOB_TIMEOUT_ENV = "QFW_IBM_JOB_TIMEOUT_SECONDS"
 JOB_TIMEOUT_KEY = "job_timeout_seconds"
 DEFAULT_JOB_TIMEOUT_SECONDS = 300
 
-# Setting the environment and constructing the resource are one step.
+# Setting the environment and constructing the resource are one step, for a
+# qrmi that has no from_config().
 #
-# QRMI takes its endpoint, key, CRN and object storage from the process
+# Such a qrmi takes its endpoint, key, CRN and object storage from the process
 # environment at construction, so _ensure_resource_env writes those variables
 # and QuantumResource() reads them. The shim QRC runs a circuit per thread,
 # and circuits from different reservations resolve different credentials, so
@@ -141,11 +143,14 @@ DEFAULT_JOB_TIMEOUT_SECONDS = 300
 # from the other one's environment. That is another user's API key, silently,
 # with the right resource id.
 #
-# QRMI has no way to pass the configuration in directly, its own config file
-# populates the same variables, so serializing the pair is the fix available
-# to us. The lock is module level rather than per driver because the
-# environment is process wide and one shim process holds a driver per wired
-# library.
+# The lock is module level rather than per driver because the environment is
+# process wide and one shim process holds a driver per wired library.
+#
+# QuantumResource.from_config() (qrmi 0.25.0 and later) takes the settings as
+# an argument instead, so _qpu prefers it and neither writes nor reads the
+# process environment while constructing. Nothing is shared between threads on
+# that path, so it does not take this lock. The lock stays for a qrmi that
+# predates from_config(), and can go once the floor is 0.25.0.
 RESOURCE_ENV_LOCK = threading.Lock()
 
 PROVIDER_RESOURCE_TYPES = {
@@ -233,6 +238,8 @@ class QrmiDriver(BaseDriver):
 		self._descriptor = descriptor or {}
 		self._qrmi = None
 		self._resource_objs = {}
+		self._resource_locks = {}
+		self._resource_locks_guard = threading.Lock()
 		self._target_cache = {}
 		self._last_job = None
 
@@ -351,41 +358,48 @@ class QrmiDriver(BaseDriver):
 		resolved.update(object_storage)
 		return resolved
 
-	def _ensure_iqm_isa_env(self, alias, credential=None):
-		# QRMI's IQM resource reads its endpoint/token from
-		# {backend}_QRMI_IQM_ISA_ENDPOINT / {backend}_QRMI_IQM_ISA_TOKEN at
-		# construction (IQMServer::new). Inside a SLURM reservation the SPANK
-		# plugin populates these; outside one (e.g. a bare introspection call)
-		# they are unset and QuantumResource() fails before target() ever runs.
-		# Resolve them from device-access config and export whichever is missing
-		# -- never overriding values the SPANK plugin already set. QRMI keys the
-		# env vars by the resource id up to the first comma
-		# (backend_name,calibration_set_id), so match that prefix here.
-		backend = alias.split(",")[0]
-		endpoint_var = f"{backend}_QRMI_IQM_ISA_ENDPOINT"
-		token_var = f"{backend}_QRMI_IQM_ISA_TOKEN"
+	def _iqm_isa_settings(self, backend, credential=None):
+		# What QRMI's IQM resource needs, as the unprefixed setting names both
+		# sinks below work in: QRMI_IQM_ISA_ENDPOINT and QRMI_IQM_ISA_TOKEN. It
+		# reads them when the resource is constructed. Inside a SLURM
+		# reservation the SPANK plugin supplies them; outside one (e.g. a bare
+		# introspection call) they are unset and the resource cannot be opened,
+		# so resolve them from device-access config instead.
+		#
+		# A value already in the environment wins, so nothing here overrides
+		# what the SPANK plugin set. A credential replaces what it supplies and
+		# leaves the rest, which is why an unsupplied half falls back to the
+		# environment rather than being cleared.
+		endpoint_key = "QRMI_IQM_ISA_ENDPOINT"
+		token_key = "QRMI_IQM_ISA_TOKEN"
+		endpoint = os.environ.get(f"{backend}_{endpoint_key}")
+		token = os.environ.get(f"{backend}_{token_key}")
 		if credential:
 			access = self._access(credential=credential)
-			if access.get("base_url"):
-				os.environ[endpoint_var] = access["base_url"]
-			if access.get("token"):
-				os.environ[token_var] = access["token"]
-			return
-		if os.environ.get(endpoint_var) and os.environ.get(token_var):
-			return
+			return {
+				endpoint_key: access.get("base_url") or endpoint,
+				token_key: access.get("token") or token,
+			}, ()
+		if endpoint and token:
+			return {endpoint_key: endpoint, token_key: token}, ()
 		access = self._access()
-		if not os.environ.get(endpoint_var) and access.get("base_url"):
-			os.environ[endpoint_var] = access["base_url"]
-		if not os.environ.get(token_var) and access.get("token"):
-			os.environ[token_var] = access["token"]
-		missing = [v for v in (endpoint_var, token_var)
-				if not os.environ.get(v)]
+		return {
+			endpoint_key: endpoint or access.get("base_url"),
+			token_key: token or access.get("token"),
+		}, (endpoint_key, token_key)
+
+	def _ensure_iqm_isa_env(self, alias, credential=None):
+		# Write the IQM pair into the process environment, for a qrmi with no
+		# from_config(). QRMI keys the variables by the resource id up to the
+		# first comma (backend_name,calibration_set_id), so match that prefix.
+		backend = alias.split(",")[0]
+		settings, required = self._iqm_isa_settings(
+			backend, credential=credential)
+		self._write_settings_env(backend, settings)
+		missing = [key for key in required
+				if not os.environ.get(f"{backend}_{key}")]
 		if missing:
-			raise DEFwExecutionError(
-				"QRMI IQM introspection needs " + " and ".join(missing) +
-				"; set them, or set QFW_QC_URL/QFW_API_KEY, or configure "
-				"device access (these are normally injected by the SPANK "
-				"plugin inside a reservation)")
+			raise self._missing_settings_error(backend, missing)
 
 	def _resource_type(self, qrmi):
 		# Resolve the ResourceType this descriptor should open. Returns the
@@ -430,17 +444,61 @@ class QrmiDriver(BaseDriver):
 		if kind:
 			self._ensure_ibm_env(kind, alias, credential=credential)
 
-	def _ensure_ibm_env(self, kind, alias, credential=None):
-		# QRMI's IBM resources read endpoint, IAM endpoint, API key and service
-		# CRN at construction, so resolve them before opening one.
+	def _write_settings_env(self, backend, settings):
+		# Settings are named without the resource prefix, because that is the
+		# form a config map takes. The environment wants them prefixed.
+		# A None clears the variable rather than leaving it, for the reason
+		# the IBM resolver returns one: a value this reservation did not
+		# supply must not be served from the previous reservation's.
+		for key, value in settings.items():
+			name = f"{backend}_{key}"
+			if value is None:
+				os.environ.pop(name, None)
+			else:
+				os.environ[name] = str(value)
+
+	def _missing_settings_error(self, backend, missing, kind=None):
+		# One message for both sinks. It names the prefixed environment
+		# variables, which stay actionable on the config path too because
+		# _resource_config takes the environment as its base.
+		names = [f"{backend}_{key}" for key in missing]
+		if kind is None:
+			return DEFwExecutionError(
+				"QRMI IQM introspection needs " + " and ".join(names) +
+				"; set them, or set QFW_QC_URL/QFW_API_KEY, or configure "
+				"device access (these are normally injected by the SPANK "
+				"plugin inside a reservation)")
+		message = (
+			"QRMI IBM access needs " + " and ".join(names) + ". The "
+			"endpoint and API key come from device-access config or "
+			"QFW_QC_URL/QFW_API_KEY. The service CRN comes from the "
+			"user's service_crn entry in the credential DB, the device's "
+			"service-crn key in device-access config, or "
+			"QFW_IBM_SERVICE_CRN")
+		if kind == "QS":
+			message += (
+				". IBMQuantumSystem also requires its object storage: the "
+				"store from the device's s3-endpoint, s3-bucket and "
+				"s3-region keys, and the key pair from the user's "
+				"aws_access_key_id and aws_secret_access_key entries in "
+				"the credential DB")
+		return DEFwExecutionError(message)
+
+	def _ibm_settings(self, kind, backend, credential=None):
+		# What QRMI's IBM resources need, as unprefixed setting names. They
+		# read endpoint, IAM endpoint, API key and service CRN when the
+		# resource is constructed, and QRMI names each service's settings
+		# after the service, so the kind selects the family.
 		#
 		# A credential bound to the caller's reservation always supplies the
-		# endpoint and API key, replacing whatever is already set, as
-		# _ensure_iqm_isa_env does for IQM. These variables are process-wide, so
-		# filling in only what is missing would let the first reservation's key
-		# open every later reservation's resource in a long-running service.
-		# Without a credential, only missing values are resolved and anything
-		# already set is kept, since an operator or a SPANK plugin may have set it.
+		# endpoint and API key, replacing whatever is already set, as the IQM
+		# resolver does. A value it does not supply resolves to None, which
+		# clears rather than inherits: these settings outlive one call in a
+		# long-running service, so filling in only what is missing would let
+		# the first reservation's key open every later reservation's resource.
+		# Without a credential only missing values are resolved and anything
+		# already set is kept, since an operator or a SPANK plugin may have
+		# set it.
 		#
 		# The endpoint and API key come from device-access config, the same
 		# source the IQM path uses. The IAM endpoint belongs to the device, so
@@ -455,45 +513,43 @@ class QrmiDriver(BaseDriver):
 		# the order _access uses for the endpoint and key. A site service
 		# relies on the config sources, since nothing a user or a job exports
 		# reaches it.
-		backend = alias.split(",")[0]
-		prefix = f"{backend}_QRMI_IBM_{kind}"
-		endpoint_var = f"{prefix}_ENDPOINT"
-		iam_endpoint_var = f"{prefix}_IAM_ENDPOINT"
-		apikey_var = f"{prefix}_IAM_APIKEY"
-		crn_var = f"{prefix}_SERVICE_CRN"
+		prefix = f"QRMI_IBM_{kind}"
+		endpoint_key = f"{prefix}_ENDPOINT"
+		iam_endpoint_key = f"{prefix}_IAM_ENDPOINT"
+		apikey_key = f"{prefix}_IAM_APIKEY"
+		crn_key = f"{prefix}_SERVICE_CRN"
 
+		def current(key):
+			return os.environ.get(f"{backend}_{key}")
+
+		settings = {}
 		access = {}
 		if credential:
-			# No fallback on this path. A credential that cannot be resolved has
-			# to fail rather than leave another reservation's endpoint or key in
-			# place, so a value it does not supply is cleared, not inherited.
+			# No fallback on this path. A credential that cannot be resolved
+			# has to fail rather than leave another reservation's endpoint or
+			# key in place.
 			access = self._access(credential=credential)
-			for name, value in (
-					(endpoint_var, access.get("base_url")),
-					(apikey_var, access.get("token"))):
-				if value:
-					os.environ[name] = value
-				else:
-					os.environ.pop(name, None)
-		elif not (os.environ.get(endpoint_var) and os.environ.get(apikey_var)):
-			try:
-				access = self._access(credential=credential)
-			except DEFwExecutionError:
-				# Fall through to the missing-variable report below, which
-				# names what to set. It is more actionable than a failure to
-				# resolve device access the caller may not be relying on.
-				access = {}
-			if not os.environ.get(endpoint_var) and access.get("base_url"):
-				os.environ[endpoint_var] = access["base_url"]
-			if not os.environ.get(apikey_var) and access.get("token"):
-				os.environ[apikey_var] = access["token"]
+			settings[endpoint_key] = access.get("base_url")
+			settings[apikey_key] = access.get("token")
+		else:
+			endpoint = current(endpoint_key)
+			apikey = current(apikey_key)
+			if not (endpoint and apikey):
+				try:
+					access = self._access(credential=credential)
+				except DEFwExecutionError:
+					# Fall through to the missing-setting report, which names
+					# what to set. It is more actionable than a failure to
+					# resolve device access the caller may not be relying on.
+					access = {}
+			settings[endpoint_key] = endpoint or access.get("base_url")
+			settings[apikey_key] = apikey or access.get("token")
 
-		if not os.environ.get(iam_endpoint_var):
-			iam_endpoint = (os.environ.get("QFW_IBM_IAM_ENDPOINT")
-				or self._descriptor.get("iam_endpoint")
-				or self._descriptor.get("iam-endpoint")
-				or IBM_DEFAULT_IAM_ENDPOINT)
-			os.environ[iam_endpoint_var] = str(iam_endpoint)
+		settings[iam_endpoint_key] = current(iam_endpoint_key) or str(
+			os.environ.get("QFW_IBM_IAM_ENDPOINT")
+			or self._descriptor.get("iam_endpoint")
+			or self._descriptor.get("iam-endpoint")
+			or IBM_DEFAULT_IAM_ENDPOINT)
 
 		crn = (dict(credential or {}).get("service_crn")
 			or os.environ.get("QFW_IBM_SERVICE_CRN")
@@ -501,48 +557,43 @@ class QrmiDriver(BaseDriver):
 			or self._descriptor.get("service_crn")
 			or self._descriptor.get("service-crn"))
 		if credential:
-			# Set for every reservation and cleared when nothing supplies one,
-			# like the endpoint and key. A CRN can belong to the user, so
+			# Resolved for every reservation and cleared when nothing supplies
+			# one, like the endpoint and key. A CRN can belong to the user, so
 			# keeping the value already set would run this reservation under
 			# the previous user's instance.
-			if crn:
-				os.environ[crn_var] = str(crn)
-			else:
-				os.environ.pop(crn_var, None)
-		elif crn and not os.environ.get(crn_var):
-			os.environ[crn_var] = str(crn)
+			settings[crn_key] = str(crn) if crn else None
+		else:
+			settings[crn_key] = current(crn_key) or (
+				str(crn) if crn else None)
 
-		# Object storage applies only to IBMQuantumSystem, which stages results
-		# through a bucket. The other IBM services never read these.
-		required = [endpoint_var, iam_endpoint_var, apikey_var, crn_var]
+		# Object storage applies only to IBMQuantumSystem, which stages
+		# results through a bucket. The other IBM services never read these.
+		required = [endpoint_key, iam_endpoint_key, apikey_key, crn_key]
 		if kind == "QS":
-			self._ensure_object_storage_env(prefix, access, credential)
-			self._ensure_job_timeout_env(backend)
+			settings.update(self._object_storage_settings(
+				prefix, backend, access, credential))
+			settings.update(self._job_timeout_settings(backend))
 			required += [
 				f"{prefix}_{suffix}" for suffix in OBJECT_STORAGE_REQUIRED]
-			required.append(f"{backend}_QRMI_JOB_TIMEOUT_SECONDS")
+			required.append(JOB_TIMEOUT_SETTING)
+		return settings, required
 
-		missing = [name for name in required if not os.environ.get(name)]
+	def _ensure_ibm_env(self, kind, alias, credential=None):
+		# Write an IBM family into the process environment, for a qrmi with no
+		# from_config().
+		backend = alias.split(",")[0]
+		settings, required = self._ibm_settings(
+			kind, backend, credential=credential)
+		self._write_settings_env(backend, settings)
+		missing = [key for key in required
+				if not os.environ.get(f"{backend}_{key}")]
 		if missing:
-			message = (
-				"QRMI IBM access needs " + " and ".join(missing) + ". The "
-				"endpoint and API key come from device-access config or "
-				"QFW_QC_URL/QFW_API_KEY. The service CRN comes from the "
-				"user's service_crn entry in the credential DB, the device's "
-				"service-crn key in device-access config, or "
-				"QFW_IBM_SERVICE_CRN")
-			if kind == "QS":
-				message += (
-					". IBMQuantumSystem also requires its object storage: the "
-					"store from the device's s3-endpoint, s3-bucket and "
-					"s3-region keys, and the key pair from the user's "
-					"aws_access_key_id and aws_secret_access_key entries in "
-					"the credential DB")
-			raise DEFwExecutionError(message)
+			raise self._missing_settings_error(backend, missing, kind=kind)
 
-	def _ensure_object_storage_env(self, prefix, access, credential=None):
+	def _object_storage_settings(self, prefix, backend, access,
+			credential=None):
 		# QRMI's IBM Quantum System stages results through object storage and
-		# reads six more variables for it.
+		# reads six more settings for it.
 		#
 		# The bucket, region and the two endpoints describe the store, so they
 		# come from the device's own device-access entry, the way iam-endpoint
@@ -554,56 +605,128 @@ class QrmiDriver(BaseDriver):
 		# Config is what makes this reachable at all. Nothing a user or a job
 		# exports reaches a site service, so an IBM Quantum System configured
 		# only through the environment cannot be driven from one.
+		settings = {}
 		for suffix, env_name, key in OBJECT_STORAGE_FIELDS:
-			name = f"{prefix}_{suffix}"
+			setting_key = f"{prefix}_{suffix}"
 			value = (
 				os.environ.get(env_name)
 				or self._descriptor.get(key)
 				or self._descriptor.get(key.replace("_", "-")))
-			if value and not os.environ.get(name):
-				os.environ[name] = str(value)
+			settings[setting_key] = (
+				os.environ.get(f"{backend}_{setting_key}")
+				or (str(value) if value else None))
 
 		credential = dict(credential or {})
 		for suffix, env_name, key in OBJECT_STORAGE_SECRETS:
-			name = f"{prefix}_{suffix}"
+			setting_key = f"{prefix}_{suffix}"
 			value = (
 				credential.get(key)
 				or os.environ.get(env_name)
 				or access.get(key))
 			if not credential:
-				if value and not os.environ.get(name):
-					os.environ[name] = str(value)
+				settings[setting_key] = (
+					os.environ.get(f"{backend}_{setting_key}")
+					or (str(value) if value else None))
 				continue
 			# With a credential these are replaced, not filled in, for the
-			# reason the endpoint and key are: the variables are process-wide,
-			# so one reservation's key would otherwise serve the next.
-			if value:
-				os.environ[name] = str(value)
-			else:
-				os.environ.pop(name, None)
+			# reason the endpoint and key are: one reservation's key would
+			# otherwise serve the next.
+			settings[setting_key] = str(value) if value else None
+		return settings
 
-	def _ensure_job_timeout_env(self, backend):
-		# {resource}_QRMI_JOB_TIMEOUT_SECONDS, which IBMQuantumSystem requires.
-		# Note the name is not under the per-service prefix. The value matches
-		# run_circuit's own default, so QRMI does not abandon a job while this
-		# driver is still polling for it.
-		name = f"{backend}_QRMI_JOB_TIMEOUT_SECONDS"
-		if os.environ.get(name):
-			return
+	def _job_timeout_settings(self, backend):
+		# QRMI_JOB_TIMEOUT_SECONDS, which IBMQuantumSystem requires. Note it
+		# is not under the per-service prefix. The value matches run_circuit's
+		# own default, so QRMI does not abandon a job while this driver is
+		# still polling for it. It is a number rather than a credential, so a
+		# device can set job-timeout-seconds and otherwise it defaults, which
+		# is friendlier than failing for the want of a value we can pick.
+		current = os.environ.get(f"{backend}_{JOB_TIMEOUT_SETTING}")
+		if current:
+			return {JOB_TIMEOUT_SETTING: current}
 		value = (
 			os.environ.get(JOB_TIMEOUT_ENV)
 			or self._descriptor.get(JOB_TIMEOUT_KEY)
 			or self._descriptor.get(JOB_TIMEOUT_KEY.replace("_", "-"))
 			or DEFAULT_JOB_TIMEOUT_SECONDS)
-		os.environ[name] = str(value)
+		return {JOB_TIMEOUT_SETTING: str(value)}
+
+	def _resource_config(self, type_name, alias, credential=None):
+		# The config map QuantumResource.from_config() opens a resource with,
+		# so the resource gets its settings without the process environment
+		# being involved at all. None means this driver has nothing to resolve
+		# for the type and the caller should use the environment path.
+		#
+		# THE MAP STARTS FROM THE ENVIRONMENT rather than replacing it. QRMI
+		# ignores the environment entirely once a map is given, and it reads
+		# settings this driver does not model: QRMI_JOB_ACQUISITION_TOKEN, and
+		# the QRS/QCS session settings SESSION_MODE, SESSION_ID,
+		# SESSION_MAX_TTL and TIMEOUT_SECONDS. The SPANK plugin sets the
+		# acquisition token and SESSION_MODE, so a map built only from what is
+		# resolved here would silently drop them and change how a job runs.
+		# Taking every {backend}_QRMI_* variable as the base keeps those
+		# working, and keeps "what the operator or SPANK set wins" true for
+		# the settings that are filled in rather than replaced.
+		backend = alias.split(",")[0]
+		kind = None
+		if type_name == "IQMServer":
+			settings, required = self._iqm_isa_settings(
+				backend, credential=credential)
+		else:
+			kind = IBM_RESOURCE_ENV_KINDS.get(type_name)
+			if not kind:
+				return None
+			settings, required = self._ibm_settings(
+				kind, backend, credential=credential)
+
+		prefix = f"{backend}_"
+		config = {
+			name[len(prefix):]: value
+			for name, value in os.environ.items()
+			if name.startswith(f"{prefix}QRMI_")
+		}
+		for key, value in settings.items():
+			if value is None:
+				config.pop(key, None)
+			else:
+				config[key] = str(value)
+
+		missing = [key for key in required if not config.get(key)]
+		if missing:
+			raise self._missing_settings_error(backend, missing, kind=kind)
+		return config
+
+	def _resource_lock(self, cache_key):
+		# One construction lock per credential. Two reservations have nothing
+		# to serialize once the process environment is out of the picture, but
+		# two threads sharing a credential must still open one resource
+		# between them: a discarded duplicate would leak the tokio runtime
+		# QRMI keeps in a ManuallyDrop.
+		with self._resource_locks_guard:
+			return self._resource_locks.setdefault(
+				cache_key, threading.Lock())
+
+	def _open_resource(self, open_resource, type_name, alias):
+		try:
+			return open_resource()
+		except Exception as exc:
+			raise self._qrmi_error(
+				exc,
+				f"failed to open QRMI {type_name} resource "
+				f"{alias!r}") from exc
 
 	def _qpu(self, credential=None):
-		# Lazy: open the QRMI QuantumResource this descriptor names. QRMI reads
-		# its credentials/config from the environment; target() is not
-		# reservation-bound, so introspection works without acquire() as long as
-		# the resource type's env vars are present (_ensure_resource_env
-		# supplies the IQM ones from device-access config when no reservation
-		# has).
+		# Lazy: open the QRMI QuantumResource this descriptor names. target()
+		# is not reservation-bound, so introspection works without acquire() as
+		# long as the resource's settings can be resolved, which the resolvers
+		# above do from device-access config when no reservation has supplied
+		# them.
+		#
+		# Two ways in. A qrmi with from_config() (0.25.0 and later) takes the
+		# settings as an argument, so the resource is built from a map and the
+		# process environment is never written. Otherwise the settings have to
+		# be written to the environment for the constructor to read back,
+		# which is why that path holds RESOURCE_ENV_LOCK across both halves.
 		cache_key = self._credential_cache_key(credential)
 		cached = self._resource_objs.get(cache_key)
 		if cached is not None:
@@ -615,22 +738,38 @@ class QrmiDriver(BaseDriver):
 				"QRMI introspection needs a QFw device id; set "
 				"QFW_QPU_DEVICE_ID or configure a device descriptor")
 		type_name, resource_type = self._resource_type(qrmi)
-		with RESOURCE_ENV_LOCK:
-			# Another thread may have opened this very resource while this one
-			# waited, so look again before building a second.
-			cached = self._resource_objs.get(cache_key)
-			if cached is not None:
-				return cached
-			self._ensure_resource_env(
+
+		config = None
+		if hasattr(qrmi.QuantumResource, "from_config"):
+			# None means this driver resolves nothing for the type (Pasqal,
+			# Alice & Bob), so the environment is still the only source and
+			# the fallback below is the right path for it.
+			config = self._resource_config(
 				type_name, alias, credential=credential)
-			try:
-				resource_obj = qrmi.QuantumResource(alias, resource_type)
-			except Exception as exc:
-				raise self._qrmi_error(
-					exc,
-					f"failed to open QRMI {type_name} resource "
-					f"{alias!r}") from exc
-			self._resource_objs[cache_key] = resource_obj
+
+		if config is not None:
+			with self._resource_lock(cache_key):
+				# Another thread may have opened this very resource while this
+				# one waited, so look again before building a second.
+				cached = self._resource_objs.get(cache_key)
+				if cached is not None:
+					return cached
+				resource_obj = self._open_resource(
+					lambda: qrmi.QuantumResource.from_config(
+						alias, resource_type, config),
+					type_name, alias)
+				self._resource_objs[cache_key] = resource_obj
+		else:
+			with RESOURCE_ENV_LOCK:
+				cached = self._resource_objs.get(cache_key)
+				if cached is not None:
+					return cached
+				self._ensure_resource_env(
+					type_name, alias, credential=credential)
+				resource_obj = self._open_resource(
+					lambda: qrmi.QuantumResource(alias, resource_type),
+					type_name, alias)
+				self._resource_objs[cache_key] = resource_obj
 		logging.debug(
 			"shim: QRMI resource opened (%s, %s)", type_name, alias)
 		return resource_obj
