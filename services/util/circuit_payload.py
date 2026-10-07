@@ -42,6 +42,15 @@ QPY_FORMATS = (QPY, QPY_GZIP)
 DEFAULT_CIRCUIT_FORMATS = (OPENQASM2,)
 
 
+def is_qpy_circuit_provided(info):
+	info = info or {}
+	circuit = info.get("circuit") or {}
+	fmt = str(circuit.get("format") or "").strip().lower()
+	if fmt in QPY_FORMATS:
+		return True
+	return False
+
+
 def circuit_payload(info):
 	# Return (format, data) for the circuit in a circuit info dict. data is
 	# text for OpenQASM 2 and bytes for QPY.

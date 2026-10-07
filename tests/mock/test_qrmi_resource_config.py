@@ -1,0 +1,399 @@
+# QRMI 0.25.0 added QuantumResource.from_config(), which takes a resource's
+# settings as a dict instead of reading them from the process environment. The
+# driver prefers it, because the environment is what made two reservations in
+# one shim process able to tread on each other: the settings are process-wide,
+# and QRMI through 0.24.4 read the IBM Quantum System object-storage pair
+# inside task_result() rather than at construction, so a second reservation
+# opening its resource could replace the AWS key a first reservation had yet
+# to read.
+#
+# Two things these guard. The map is built by ONE resolver shared with the
+# environment path, so the two cannot drift; test_the_two_paths_agree is the
+# check that matters, since the precedence is subtle (a credential replaces, a
+# bare call fills in, the CRN has a four-level order). And the map STARTS from
+# the environment, because QRMI ignores the environment once a map is given
+# and reads settings this driver does not model, including the acquisition
+# token and the QRS/QCS session settings that the SPANK plugin sets.
+
+import os
+import pathlib
+import sys
+import threading
+import types
+
+import pytest
+
+
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
+SERVICES = str(REPO_ROOT / "services")
+if SERVICES not in sys.path:
+	sys.path.insert(0, SERVICES)
+
+from defw_exception import DEFwExecutionError  # noqa: E402
+from svc_lib_qpm.drivers.qrmi_driver import QrmiDriver  # noqa: E402
+
+
+BACKEND = "ibm_torino"
+SUFFIXES = (
+	"ENDPOINT", "IAM_ENDPOINT", "IAM_APIKEY", "SERVICE_CRN",
+	"S3_ENDPOINT", "S3_ENDPOINT_FOR_QSAPI", "S3_BUCKET", "S3_REGION",
+	"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY",
+)
+QFW_VARS = (
+	"QFW_IBM_SERVICE_CRN", "QFW_IBM_IAM_ENDPOINT",
+	"QFW_IBM_S3_ENDPOINT", "QFW_IBM_S3_ENDPOINT_FOR_QSAPI",
+	"QFW_IBM_S3_BUCKET", "QFW_IBM_S3_REGION",
+	"QFW_IBM_AWS_ACCESS_KEY_ID", "QFW_IBM_AWS_SECRET_ACCESS_KEY",
+	"QFW_IBM_JOB_TIMEOUT_SECONDS", "QFW_QC_URL", "QFW_API_KEY",
+)
+
+STORE = {
+	"s3-endpoint": "https://store.example",
+	"s3-endpoint-for-qsapi": "https://store.internal",
+	"s3-bucket": "results",
+	"s3-region": "us-east",
+}
+KEY_PAIR = {
+	"aws_access_key_id": "AKIA-db",
+	"aws_secret_access_key": "secret-db",
+}
+
+
+def _clear():
+	for name in list(os.environ):
+		if name.startswith(f"{BACKEND}_") or name.startswith("default_"):
+			del os.environ[name]
+	for name in QFW_VARS:
+		os.environ.pop(name, None)
+
+
+@pytest.fixture(autouse=True)
+def clean_env():
+	# These helpers write into os.environ by design, so every test starts and
+	# ends from a known-empty set rather than inheriting another test's writes.
+	_clear()
+	yield
+	_clear()
+
+
+def _driver(access=None, **descriptor):
+	descriptor.setdefault("provider", "ibm")
+	driver = QrmiDriver(descriptor)
+	resolved = {"base_url": "https://example.org", "token": "tok"}
+	if access is not None:
+		resolved = access
+	driver._access = lambda credential=None: dict(resolved)
+	return driver
+
+
+def _qs_driver(**descriptor):
+	descriptor.update(STORE)
+	access = {"base_url": "https://example.org", "token": "tok"}
+	access.update(KEY_PAIR)
+	return _driver(access=access, **descriptor)
+
+
+def _env_settings(make_driver, type_name, kind, alias, credential=None):
+	# What the environment path leaves behind, as unprefixed keys, so it can
+	# be compared with a config map.
+	_clear()
+	driver = make_driver()
+	if kind is None:
+		driver._ensure_iqm_isa_env(alias, credential=credential)
+	else:
+		driver._ensure_ibm_env(kind, alias, credential=credential)
+	backend = alias.split(",")[0]
+	prefix = f"{backend}_"
+	return {
+		name[len(prefix):]: value
+		for name, value in os.environ.items()
+		if name.startswith(f"{prefix}QRMI_")
+	}
+
+
+def _config_settings(make_driver, type_name, alias, credential=None):
+	_clear()
+	return make_driver()._resource_config(
+		type_name, alias, credential=credential)
+
+
+# What to resolve, as (label, driver factory, resource type, IBM kind, alias,
+# credential). Each is run down both paths and the results compared.
+CASES = (
+	(
+		"qrs without a credential",
+		lambda: _driver(service_crn="crn:device"),
+		"IBMQiskitRuntimeService", "QRS", BACKEND, None,
+	),
+	(
+		"qrs with a credential",
+		lambda: _driver(service_crn="crn:device"),
+		"IBMQiskitRuntimeService", "QRS", BACKEND,
+		{"user": "alice", "service_crn": "crn:alice"},
+	),
+	(
+		"qrs with a credential that names no instance",
+		lambda: _driver(service_crn="crn:device"),
+		"IBMQiskitRuntimeService", "QRS", BACKEND, {"user": "alice"},
+	),
+	(
+		"qcs picks its own family",
+		lambda: _driver(service_crn="crn:device"),
+		"IBMQuantumComputeService", "QCS", BACKEND, None,
+	),
+	(
+		"quantum system without a credential",
+		lambda: _qs_driver(service_crn="crn:device"),
+		"IBMQuantumSystem", "QS", BACKEND, None,
+	),
+	(
+		"quantum system with a credential",
+		lambda: _qs_driver(service_crn="crn:device"),
+		"IBMQuantumSystem", "QS", BACKEND,
+		dict({"user": "alice", "service_crn": "crn:alice"}, **KEY_PAIR),
+	),
+	(
+		"quantum system with a device job timeout",
+		lambda: _qs_driver(service_crn="crn:device", **{
+			"job-timeout-seconds": 900}),
+		"IBMQuantumSystem", "QS", BACKEND, None,
+	),
+	(
+		"iqm without a credential",
+		lambda: _driver(provider="iqm"),
+		"IQMServer", None, "default", None,
+	),
+	(
+		"iqm with a credential",
+		lambda: _driver(provider="iqm"),
+		"IQMServer", None, "default", {"user": "alice"},
+	),
+	(
+		"iqm alias carrying a calibration set",
+		lambda: _driver(provider="iqm"),
+		"IQMServer", None, "default,cal-7", None,
+	),
+)
+
+
+@pytest.mark.parametrize(
+	"label,make_driver,type_name,kind,alias,credential",
+	CASES, ids=[case[0] for case in CASES])
+def test_the_two_paths_agree(
+		label, make_driver, type_name, kind, alias, credential):
+	# The anti-drift check. One resolver feeds both sinks, so a config map and
+	# the variables the environment path writes have to come out identical.
+	# Starting from an empty environment there is nothing to carry over, so
+	# the map is exactly what was resolved.
+	from_env = _env_settings(
+		make_driver, type_name, kind, alias, credential=credential)
+	from_config = _config_settings(
+		make_driver, type_name, alias, credential=credential)
+
+	assert from_config == from_env, label
+
+
+def test_a_type_with_nothing_to_resolve_has_no_config():
+	# Pasqal and Alice & Bob have no device-access mapping, so the
+	# environment is still their only source and _qpu must fall back to it.
+	assert _driver(provider="pasqal")._resource_config(
+		"PasqalCloud", "fresnel") is None
+
+
+def test_the_map_carries_settings_the_driver_does_not_model(monkeypatch):
+	# QRMI ignores the environment once a map is given, and it reads more than
+	# this driver resolves. The SPANK plugin sets the acquisition token and
+	# SESSION_MODE, so dropping them would change how a job runs.
+	monkeypatch.setenv("QFW_IBM_SERVICE_CRN", "crn:x")
+	monkeypatch.setenv(f"{BACKEND}_QRMI_JOB_ACQUISITION_TOKEN", "acq-token")
+	monkeypatch.setenv(f"{BACKEND}_QRMI_IBM_QRS_SESSION_MODE", "dedicated")
+	monkeypatch.setenv(f"{BACKEND}_QRMI_IBM_QRS_SESSION_MAX_TTL", "28800")
+
+	config = _driver()._resource_config("IBMQiskitRuntimeService", BACKEND)
+
+	assert config["QRMI_JOB_ACQUISITION_TOKEN"] == "acq-token"
+	assert config["QRMI_IBM_QRS_SESSION_MODE"] == "dedicated"
+	assert config["QRMI_IBM_QRS_SESSION_MAX_TTL"] == "28800"
+
+
+def test_only_this_backends_settings_are_carried(monkeypatch):
+	# The environment holds one family per resource id, so another device's
+	# variables must not leak into this one's map.
+	monkeypatch.setenv("QFW_IBM_SERVICE_CRN", "crn:x")
+	monkeypatch.setenv("other_device_QRMI_IBM_QRS_SESSION_MODE", "batch")
+	monkeypatch.setenv("QRMI_IBM_QRS_SESSION_MODE", "batch")
+	try:
+		config = _driver()._resource_config(
+			"IBMQiskitRuntimeService", BACKEND)
+		assert "QRMI_IBM_QRS_SESSION_MODE" not in config
+	finally:
+		monkeypatch.delenv(
+			"other_device_QRMI_IBM_QRS_SESSION_MODE", raising=False)
+
+
+def test_a_credential_clears_what_it_does_not_supply(monkeypatch):
+	# The reason the resolver returns None for an absent value rather than
+	# leaving it: a CRN left over in the environment would otherwise run this
+	# reservation under the previous user's instance.
+	monkeypatch.setenv(f"{BACKEND}_QRMI_IBM_QRS_SERVICE_CRN", "crn:previous")
+
+	config = _driver()._resource_config(
+		"IBMQiskitRuntimeService", BACKEND,
+		credential={"user": "alice", "service_crn": "crn:alice"})
+	assert config["QRMI_IBM_QRS_SERVICE_CRN"] == "crn:alice"
+
+	with pytest.raises(DEFwExecutionError) as excinfo:
+		_driver()._resource_config(
+			"IBMQiskitRuntimeService", BACKEND,
+			credential={"user": "bob"})
+	assert f"{BACKEND}_QRMI_IBM_QRS_SERVICE_CRN" in str(excinfo.value)
+
+
+def test_a_credential_clears_the_previous_key_pair(monkeypatch):
+	# Same for the object-storage pair, which is the leak this change closes.
+	monkeypatch.setenv(
+		f"{BACKEND}_QRMI_IBM_QS_AWS_ACCESS_KEY_ID", "AKIA-previous")
+	monkeypatch.setenv(
+		f"{BACKEND}_QRMI_IBM_QS_AWS_SECRET_ACCESS_KEY", "secret-previous")
+
+	config = _qs_driver(service_crn="crn:device")._resource_config(
+		"IBMQuantumSystem", BACKEND, credential=dict(
+			{"user": "alice"},
+			aws_access_key_id="AKIA-alice",
+			aws_secret_access_key="secret-alice"))
+
+	assert config["QRMI_IBM_QS_AWS_ACCESS_KEY_ID"] == "AKIA-alice"
+	assert config["QRMI_IBM_QS_AWS_SECRET_ACCESS_KEY"] == "secret-alice"
+
+
+def test_missing_settings_are_reported_before_qrmi_is_opened():
+	# The same message the environment path raises, naming the prefixed
+	# variables, which stay actionable because the map starts from them.
+	with pytest.raises(DEFwExecutionError) as excinfo:
+		_driver()._resource_config("IBMQiskitRuntimeService", BACKEND)
+	message = str(excinfo.value)
+	assert f"{BACKEND}_QRMI_IBM_QRS_SERVICE_CRN" in message
+	assert "service-crn" in message
+	assert "SPANK" not in message
+
+
+# --------------------------------------------------------------------------
+# _qpu's choice of path, and what the config path does not touch.
+
+class _EnvOnlyResource:
+	# Stands in for a qrmi that predates from_config(), which the driver must
+	# still open through the environment. It records how it was opened.
+	def __init__(self, alias, resource_type, config=None):
+		self.alias = alias
+		self.config = config
+		# What the environment held while this was constructed, so a test can
+		# tell whether the settings went through it.
+		self.env = {
+			name: value for name, value in os.environ.items()
+			if name.startswith(f"{alias.split(',')[0]}_QRMI_")
+		}
+
+
+class _Resource(_EnvOnlyResource):
+	# And one that carries from_config(), which the driver should prefer.
+	@staticmethod
+	def from_config(alias, resource_type, config):
+		return _Resource(alias, resource_type, config=dict(config))
+
+
+def _wired(resource_class, **descriptor):
+	descriptor.setdefault("provider", "ibm")
+	descriptor.setdefault("resource-type", "IBMQiskitRuntimeService")
+	descriptor.setdefault("provider-device-id", BACKEND)
+	descriptor.setdefault("service_crn", "crn:device")
+	driver = _driver(**descriptor)
+	driver._qrmi = types.SimpleNamespace(
+		ResourceType=types.SimpleNamespace(
+			IBMQiskitRuntimeService="IBMQiskitRuntimeService"),
+		QuantumResource=resource_class)
+	return driver
+
+
+def test_the_config_path_never_writes_the_environment():
+	# The point of the change. Nothing about opening a resource should leave a
+	# credential in a process-wide variable.
+	driver = _wired(_Resource)
+
+	resource = driver._qpu(credential={"user": "alice"})
+
+	assert resource.config["QRMI_IBM_QRS_IAM_APIKEY"] == "tok"
+	assert resource.env == {}
+	leaked = [name for name in os.environ if name.startswith(f"{BACKEND}_")]
+	assert leaked == []
+
+
+def test_a_qrmi_without_from_config_still_opens_through_the_environment():
+	driver = _wired(_EnvOnlyResource)
+
+	resource = driver._qpu(credential={"user": "alice"})
+
+	assert resource.config is None
+	assert resource.env[f"{BACKEND}_QRMI_IBM_QRS_IAM_APIKEY"] == "tok"
+
+
+def test_each_reservation_opens_with_its_own_settings():
+	# What the environment path needed a process-wide lock for. Here each
+	# thread carries its own map, so there is nothing to serialize.
+	driver = _wired(_Resource)
+
+	def _access(credential=None):
+		user = dict(credential or {}).get("user", "operator")
+		return {
+			"base_url": f"https://{user}.example.org",
+			"token": f"{user}-key",
+		}
+
+	driver._access = _access
+	users = [f"user-{index}" for index in range(8)]
+	opened = {}
+	errors = []
+
+	def work(user):
+		try:
+			resource = driver._qpu(credential={"user": user})
+			opened[user] = resource.config["QRMI_IBM_QRS_IAM_APIKEY"]
+		except Exception as exc:  # pragma: no cover - surfaced by the assert
+			errors.append(exc)
+
+	threads = [threading.Thread(target=work, args=(user,)) for user in users]
+	for thread in threads:
+		thread.start()
+	for thread in threads:
+		thread.join()
+
+	assert not errors, errors
+	assert opened == {user: f"{user}-key" for user in users}
+
+
+def test_threads_sharing_a_credential_open_one_resource():
+	# Per-credential locking still has to hold, because a discarded duplicate
+	# would leak the tokio runtime QRMI keeps in a ManuallyDrop.
+	driver = _wired(_Resource)
+	built = []
+	real = _Resource.from_config
+
+	def counting_from_config(alias, resource_type, config):
+		built.append(alias)
+		return real(alias, resource_type, config)
+
+	driver._qrmi.QuantumResource = types.SimpleNamespace(
+		from_config=counting_from_config)
+
+	credential = {"user": "alice"}
+	threads = [
+		threading.Thread(target=driver._qpu, kwargs={"credential": dict(
+			credential)})
+		for _ in range(8)
+	]
+	for thread in threads:
+		thread.start()
+	for thread in threads:
+		thread.join()
+
+	assert len(built) == 1
+	assert len(driver._resource_objs) == 1

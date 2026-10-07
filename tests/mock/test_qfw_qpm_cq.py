@@ -36,6 +36,12 @@ class RecordingController:
 	def retry_pending_capacity(self):
 		self.retry_count += 1
 
+	def begin_oor_drain(self):
+		return True
+
+	def end_oor_drain(self):
+		return False
+
 
 def _make_qpm(controller):
 	qpm = util_qpm.UTIL_QPM.__new__(util_qpm.UTIL_QPM)

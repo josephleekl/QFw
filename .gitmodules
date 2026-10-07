@@ -18,3 +18,7 @@
 	path = external/qhw-scheduler
 	url = ../qhw-scheduler.git
 	branch = main
+[submodule "external/qhw-ibm"]
+	path = external/qhw-ibm
+	url = ../qhw-ibm.git
+	branch = main

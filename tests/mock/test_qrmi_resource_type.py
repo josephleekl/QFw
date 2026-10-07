@@ -206,11 +206,14 @@ def test_driver_skips_iqm_env_setup_for_non_iqm_types():
 	# _ensure_iqm_isa_env writes IQM-shaped variables and raises when it cannot
 	# resolve them, so it must not run for a non-IQM resource type.
 	driver = QrmiDriver({"provider": "ibm"})
-	called = []
-	driver._ensure_iqm_isa_env = lambda *args, **kwargs: called.append(args)
+	iqm_called = []
+	ibm_called = []
+	driver._ensure_iqm_isa_env = lambda *args, **kwargs: iqm_called.append(args)
+	driver._ensure_ibm_env = lambda *args, **kwargs: ibm_called.append(args)
 
 	driver._ensure_resource_env("IBMQuantumSystem", "ibm_torino")
-	assert called == []
+	assert iqm_called == []
+	assert len(ibm_called) == 1
 
 	driver._ensure_resource_env("IQMServer", "default")
-	assert len(called) == 1
+	assert len(iqm_called) == 1
