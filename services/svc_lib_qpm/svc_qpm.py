@@ -3,7 +3,7 @@ import os
 from .svc_qrc import QRC
 from util.qpm.util_qpm import UTIL_QPM
 from util.qpm.util_circuit import set_max_qubits_pp
-from util.circuit_payload import qiskit_circuit_formats
+from util.circuit_payload import qiskit_circuit_formats, OPENQASM2
 
 MAX_SHIM_QUBITS = 1024
 MAX_SHIM_SHOTS = 10000
@@ -21,6 +21,7 @@ class QPM(UTIL_QPM):
 	def query(self):
 		from . import SERVICE_NAME, SERVICE_DESC, svc_info
 		from api_qpm_common import QPMType, QPMCapability
+		from .descriptor import resolve_descriptor
 		properties = dict(svc_info.get('properties', {}))
 		device_id = os.environ.get('QFW_QPU_DEVICE_ID')
 		if device_id:
@@ -29,6 +30,15 @@ class QPM(UTIL_QPM):
 		# OpenQASM 2, unless the service's own configuration says otherwise.
 		for key, value in qiskit_circuit_formats().items():
 			properties.setdefault(key, value)
+		# IBM devices reject OpenQASM 2 at run time (_run_ibm_circuit requires
+		# QPY). Remove it from the declaration so a client that cannot write QPY
+		# gets a clear error on format negotiation rather than a silent fallback
+		# that only fails once the circuit reaches the device.
+		descriptor = resolve_descriptor()
+		if descriptor.get("provider", "").lower() == "ibm":
+			formats = properties.get("circuit_formats", [])
+			properties["circuit_formats"] = [
+				f for f in formats if f != OPENQASM2]
 		info = self.query_helper(
 			QPMType.QPM_TYPE_HARDWARE,
 			QPMCapability.QPM_CAP_SUPERCONDUCTING,

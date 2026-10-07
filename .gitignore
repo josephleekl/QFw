@@ -1,2 +1,4 @@
 docs/**/*.jsonl
 docs/json/
+**/__pycache__/
+**/*.swp

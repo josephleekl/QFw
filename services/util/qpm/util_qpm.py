@@ -14,11 +14,12 @@ from defw_exception import (
 	DEFwOutOfResources,
 )
 from .controller import (
+	QPM_TASK_CAPACITY_HELD,
+	QPM_TASK_CREATED,
 	QPM_TASK_PENDING_CAPACITY,
-	QPM_TASK_QUEUED,
 	QPM_TASK_RESOURCES_CONSUMED,
-	QPM_TASK_SELECTED,
 	QPM_TASK_TERMINAL_STATES,
+	QPMTaskNotActive,
 	controller_config,
 	get_target_controller,
 )
@@ -49,6 +50,10 @@ QPM_CATEGORY_API_BINDINGS = (
 qpm_initialized = False
 qpm_shutdown = False
 qpm_directory_registered = False
+
+
+class QTaskNotActive(DEFwExecutionError):
+	"""Another thread has already finished, failed or retired the task."""
 
 
 class QPMEventDispatcher:
@@ -285,22 +290,55 @@ class UTIL_QPM:
 		logging.debug(f"Circuit consumed: {consumed_res}")
 
 	def process_oor_queue(self):
-		self.controller.retry_pending_capacity()
-		while True:
-			if not self._prune_oor_queue():
-				break
+		"""Dispatch what the out-of-resources queue holds, as far as
+		resources allow.
+
+		Every provider completion and read_cq calls this, so one thread
+		drains at a time. Two used to take the same queued task and
+		dispatch it twice. A thread that finds a drain under way leaves
+		it a request for another pass, which that thread makes before it
+		lets go, so nothing a completion frees waits for the next call.
+		"""
+		while self.controller.begin_oor_drain():
 			try:
-				cid = self._next_oor_cid_without_scheduler_task()
+				self._drain_oor_queue()
+			finally:
+				again = self.controller.end_oor_drain()
+			if not again:
+				return
+
+	def _drain_oor_queue(self):
+		self.controller.retry_pending_capacity()
+		while self._prune_oor_queue():
+			cid = self._next_oor_cid_without_scheduler_task()
+			try:
 				if cid is not None:
 					self.async_run_oor(cid)
 					self._remove_oor_cid(cid)
-				else:
-					status = self.dispatch_ready_qtask()
-					if status is None:
-						break
-					self._remove_oor_cid(status.get("cid"))
+					continue
+				status = self.dispatch_ready_qtask()
+				if status is None:
+					return
+				self._remove_oor_cid(status.get("cid"))
 			except DEFwOutOfResources:
-				break
+				return
+			except QTaskNotActive:
+				# Another thread ended it, so there is
+				# nothing to dispatch.
+				self._remove_oor_cid(cid)
+			except Exception as error:
+				# The dispatch has already failed the task
+				# this belongs to. It is not the caller's,
+				# whose own call or result must not carry
+				# it. The drain stops, as it did when the
+				# error escaped, so a fault every task would
+				# meet, such as a QPU the scheduler holds
+				# busy, fails one task and not the queue.
+				logging.warning(
+					"dispatching queued work: "
+					f"{type(error).__name__}: {error}")
+				self._remove_oor_cid(cid)
+				return
 
 	def _prune_oor_queue(self):
 		active = []
@@ -362,14 +400,22 @@ class UTIL_QPM:
 		self.free_resources(circ, result=result)
 		# When resources are free, go through the queue and try
 		# to consume circuits from that queue until you run out of
-		# resources again.
-		self.process_oor_queue()
+		# resources again. A provider's thread calls this before it
+		# hands over its own result, so a failure here, which belongs to
+		# another task, must not escape and lose that result.
+		try:
+			self.process_oor_queue()
+		except Exception as error:
+			logging.warning(
+				"dispatching queued work after "
+				f"{circ.get_cid()}: "
+				f"{type(error).__name__}: {error}")
 
 	def _prepare_run_circuit(self, cid, require_selected_cid=False):
 		with self.controller.lock:
 			circuit = self.circuits.get(cid)
 		if circuit is None:
-			raise DEFwExecutionError(
+			raise QTaskNotActive(
 				f"qtask circuit record is no longer active: cid={cid}")
 		try:
 			if (circuit.info["qtask_id"]
@@ -377,13 +423,8 @@ class UTIL_QPM:
 				self.controller.authorize_capacity_hold(circuit)
 			self.controller.submit_qtask_to_scheduler(circuit)
 			selected_runtime = self.controller.select_qtask_for_dispatch()
-			if selected_runtime is None:
-				raise DEFwOutOfResources(
-					"scheduler has no dispatch slot available")
-			if require_selected_cid and selected_runtime.cid != cid:
-				raise DEFwOutOfResources(
-					"scheduler selected earlier queued work")
-			circuit = self.circuits[selected_runtime.cid]
+		except QPMTaskNotActive as error:
+			raise QTaskNotActive(str(error))
 		except QPMAdmissionPendingCapacity as error:
 			raise DEFwOutOfResources(str(error))
 		except (QPMAdmissionUnavailable,
@@ -391,28 +432,79 @@ class UTIL_QPM:
 			QPMSchedulerUnavailable,
 			QPMSchedulerError) as error:
 			raise DEFwExecutionError(str(error))
+		if selected_runtime is None:
+			raise DEFwOutOfResources(
+				"scheduler has no dispatch slot available")
+		# This thread holds the selected task now, and gives it back on
+		# every way out but a provider submission.
+		try:
+			if require_selected_cid and selected_runtime.cid != cid:
+				raise DEFwOutOfResources(
+					"scheduler selected earlier "
+					"queued work")
+			circuit = self._consume_for_dispatch(selected_runtime)
+		except Exception:
+			self.controller.release_dispatch_claim(
+				selected_runtime.qtask_id)
+			raise
+		logging.debug(f"Running {cid}\n{circuit.info}")
+		try:
+			if circuit.info.get("reservation_id") is not None:
+				self.controller.attach_provider_credential(
+					circuit)
+			self.prepare_provider_submission(circuit)
+		except Exception as error:
+			# The task holds resources and has not reached its
+			# provider. A caller sees no circuit to clean up, so
+			# fail the task and give them back here.
+			self.fail_provider_submission(circuit, error)
+			self.free_resources(circuit)
+			raise
+		return circuit
+
+	def _consume_for_dispatch(self, runtime):
+		"""The claimed task's circuit, holding the resources it needs.
+
+		The check that the task is still live and the taking of its
+		resources happen under one hold of the lock. Apart, a thread
+		could take resources for a task another had just finished and
+		retired, then fail, and nothing would ever give them back: on
+		a QPM with one slot, nothing more would run.
+		"""
 		with self.controller.lock:
+			circuit = self.circuits.get(runtime.cid)
+			current = self.controller.task_for_qtask_id(
+				runtime.qtask_id)
+			ended = (current is None or
+				current.state in QPM_TASK_TERMINAL_STATES)
+			if circuit is None or ended:
+				raise QTaskNotActive(
+					"qtask circuit record is no longer "
+					f"active: cid={runtime.cid}")
 			self.consume_resources(circuit)
 			circuit.set_resources_consumed()
 			self.controller.set_task_state(
-				circuit.info["qtask_id"], QPM_TASK_RESOURCES_CONSUMED)
-		logging.debug(f"Running {cid}\n{circuit.info}")
-		if circuit.info.get("reservation_id") is not None:
-			self.controller.attach_provider_credential(circuit)
-		self.prepare_provider_submission(circuit)
+				runtime.qtask_id, QPM_TASK_RESOURCES_CONSUMED)
 		return circuit
 
 	def prepare_provider_submission(self, circuit):
 		return circuit
 
+	def _start_provider_submission(self, circuit):
+		try:
+			return self.controller.start_provider_submission(
+				circuit)
+		except QPMTaskNotActive as error:
+			raise QTaskNotActive(str(error))
+
 	def submit_provider_sync(self, circuit):
-		runtime = self.controller.start_provider_submission(circuit)
+		runtime = self._start_provider_submission(circuit)
 		if runtime is None:
 			raise DEFwOutOfResources("qtask is already submitted")
 		return self.qrc.sync_run(circuit)
 
 	def submit_provider_async(self, circuit, return_status=False):
-		runtime = self.controller.start_provider_submission(circuit)
+		runtime = self._start_provider_submission(circuit)
 		if runtime is None:
 			if return_status:
 				return self.controller.task_status_for_cid(
@@ -437,20 +529,41 @@ class UTIL_QPM:
 		return provider_handle
 
 	def dispatch_ready_qtask(self):
+		runtime = self.controller.select_qtask_for_dispatch()
+		if runtime is None:
+			return None
 		circuit = None
 		try:
-			runtime = self.controller.select_qtask_for_dispatch()
-			if runtime is None:
-				return None
 			circuit = self._prepare_run_circuit(
 				runtime.cid, require_selected_cid=True)
 			return self.submit_provider_async(circuit, return_status=True)
 		except DEFwOutOfResources:
+			self.controller.release_dispatch_claim(runtime.qtask_id)
 			if circuit is not None:
 				self.defer_local_retry(circuit.get_cid())
 			raise
+		except QTaskNotActive:
+			# Another thread ended it, a cancel or a release, so
+			# there is nothing to dispatch and nothing to fail. If
+			# it ended after it took its resources, nothing else
+			# gives them back.
+			self.controller.release_dispatch_claim(runtime.qtask_id)
+			if circuit is not None and "hosts" in circuit.info:
+				self.free_resources(circuit)
+			return {"cid": runtime.cid, "outcome": "NOT_ACTIVE"}
 		except Exception as e:
-			if circuit is not None:
+			if circuit is None:
+				# _prepare_run_circuit holds no resources
+				# when it fails. Fail the task, or it stays
+				# selected and fails every dispatch after.
+				with self.controller.lock:
+					circuit = self.circuits.get(runtime.cid)
+				if circuit is not None:
+					self.fail_provider_submission(
+						circuit, e)
+				self.controller.release_dispatch_claim(
+					runtime.qtask_id)
+			else:
 				self.fail_provider_submission(circuit, e)
 				if "hosts" in circuit.info:
 					self.free_resources(circuit)
@@ -740,6 +853,13 @@ class UTIL_QPM:
 				self.dispatch_ready_qtask()
 			except DEFwOutOfResources:
 				pass
+			except Exception as error:
+				# The earlier task's own failure, which
+				# dispatch has recorded on it. This caller's
+				# task is fine.
+				logging.warning(
+					"dispatching earlier queued work: "
+					f"{type(error).__name__}: {error}")
 			self.defer_local_retry(cid)
 			self.oor_queue.put(cid)
 		except Exception as e:
@@ -758,13 +878,21 @@ class UTIL_QPM:
 			cid, reservation_id=request.context.reservation_id)
 
 	def defer_local_retry(self, cid):
-		runtime = self.controller.task_for_cid(cid)
-		if runtime is None:
-			return
-		if runtime.state in (QPM_TASK_QUEUED, QPM_TASK_SELECTED):
-			return
-		self.controller.set_task_state(
-			runtime.qtask_id, QPM_TASK_PENDING_CAPACITY)
+		"""Mark a task that has not reached the scheduler's queue as
+		waiting for capacity.
+
+		A task further on is left alone. Another thread may be
+		dispatching it, or have failed it, and writing over its state
+		strands the slot it holds, so the check and the write share one
+		hold of the lock.
+		"""
+		early = (QPM_TASK_CREATED, QPM_TASK_CAPACITY_HELD)
+		with self.controller.lock:
+			runtime = self.controller.task_for_cid(cid)
+			if runtime is None or runtime.state not in early:
+				return
+			self.controller.set_task_state(
+				runtime.qtask_id, QPM_TASK_PENDING_CAPACITY)
 
 	def read_cq(self, cid=None, reservation_id=None, token=None):
 		if not qpm_initialized:
