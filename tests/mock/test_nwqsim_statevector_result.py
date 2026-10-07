@@ -5,6 +5,10 @@ import pytest
 from defw_exception import DEFwError
 from svc_nwqsim_qpm.svc_qrc import QRC
 
+import numpy
+
+_HAS_REAL_NUMPY = hasattr(numpy, "fromfile")
+
 
 class _Statevector:
 	def to_dict(self):
@@ -57,6 +61,28 @@ def test_statevector_result_keeps_measurement_parsing_strict(tmp_path):
 
 	with pytest.raises(DEFwError):
 		qrc.parse_task_result(out, _circuit(dump_file), {})
+
+
+@pytest.mark.skipif(not _HAS_REAL_NUMPY, reason="needs real numpy")
+def test_parse_statevector_dump_reads_planar_layout(tmp_path):
+	from util.qpm.statevector import decode_statevector_payload
+
+	dump_file = tmp_path / "statevector.dump"
+	amplitude = 2 ** -0.5
+	real = numpy.zeros(16, dtype=numpy.float64)
+	real[0] = amplitude
+	real[15] = amplitude
+	imag = numpy.zeros(16, dtype=numpy.float64)
+	numpy.concatenate([real, imag]).tofile(dump_file)
+
+	qrc = _qrc()
+	statevector = qrc.parse_statevector_dump(dump_file, num_qubits=4)
+	amplitudes = decode_statevector_payload(statevector.to_dict())
+
+	expected = numpy.zeros(16, dtype=numpy.complex128)
+	expected[0] = amplitude
+	expected[15] = amplitude
+	numpy.testing.assert_allclose(amplitudes, expected)
 
 
 def test_count_result_still_requires_measurements(tmp_path):
