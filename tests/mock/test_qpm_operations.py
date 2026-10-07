@@ -542,6 +542,34 @@ def test_completion_events_keep_reservation_scope_after_cleanup(monkeypatch):
 	assert qpm.fake_qrc.circuit_results == []
 
 
+def test_text_reservation_listener_gets_completion(monkeypatch):
+	# Clients read the reservation id from QFW_RESERVATIONS as text. The QPM
+	# stores it as a number.
+	_setup(monkeypatch)
+	qpm = CompletingQPM(target_id="ops-events-text-reservation")
+	sinks = {}
+
+	def event_api_factory(class_id=None, target=None):
+		sink = CapturingEventAPI(class_id=class_id, target=target)
+		sinks[class_id] = sink
+		return sink
+
+	monkeypatch.setattr(util_qpm, "BaseEventAPI", event_api_factory)
+	reservation = qpm.reserve(request={"num_qubits": 2})
+	text_id = str(reservation["reservation_id"])
+	qpm.register_event_notification(
+		"endpoint-a", "circ-result", "class-a", reservation_id=text_id)
+
+	response = qpm.async_run({
+		"qasm": "OPENQASM 2.0;",
+		"num_qubits": 2,
+		"reservation_id": text_id,
+	})
+
+	assert [event["cid"] for event in sinks["class-a"].events] == [
+		response["cid"]]
+
+
 def test_result_reads_keep_reservation_scope_after_cleanup(monkeypatch):
 	_setup(monkeypatch)
 	qpm = CompletingQPM(target_id="ops-results-cleanup")
