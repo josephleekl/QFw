@@ -473,6 +473,63 @@ Means are not in the table because each run's first job carries the
 backend's construction and connection, five to six seconds, and dominates
 them. p50 and CPU per job are the statistics to compare.
 
+#### Measured in the target environment, October 2026: the footprint
+
+What this design, the DEFw v2 RPC path on Margo, and the rest of the
+autumn's work added to the size of QFw and to what it needs to run, measured
+on the same reference deployment on 2026-10-08 (the image of 2026-10-07,
+13.4 GB; the image before it was 13.06 GB). The question comes up whenever
+a site asks what it is taking on. The answer is that the framework itself is
+small, and the weight is in the toolchains and SDKs it is built against.
+
+On disk, inside the cluster image:
+
+| Component | Size | Note |
+| --- | --- | --- |
+| LLVM/MLIR 23 | 3.5 GB | Builds MQT Core's compiler |
+| Rust toolchain | 1.8 GB | Builds QRMI |
+| The Python venv: Qiskit, PySCF, SciPy, PennyLane, SymPy and the rest | 1.2 GB | The quantum SDKs, not QFw |
+| MQT venv, TNQVM, QRMI | 0.8 GB | |
+| Mochi stack: Margo, Mercury, Argobots | 11 MB | The DEFw v2 RPC path |
+| libfabric | 6 MB | |
+| QFw, installed | 8 MB | |
+| OpenTelemetry SDK and OTLP exporter | 5 MB | The one Python dependency this design added |
+
+The collector, Prometheus, Tempo and Grafana images are another 2.1 GB,
+pulled separately and only where the dashboards run.
+
+In code, QFw is 52,000 lines without DEFw. Since `v0.1.0-rc.1` (2026-09-10)
+it gained 12,000 lines in 80 commits, but 45% of that is mock tests; the
+production growth is about 5,000 lines, in the drivers, the instrumentation
+layer and the QPM hooks. DEFw is 16,000 lines, 7,400 of them C, and gained
+2,600 lines in 24 commits for the Margo path.
+
+Running:
+
+| What | Measured |
+| --- | --- |
+| The 24 cluster containers together | 1.65 GB resident |
+| The four telemetry containers together | 0.44 GB resident: Grafana 264 MB, Tempo 67 MB, Prometheus 62 MB, the collector 50 MB; under 4% of one core between jobs |
+| A v1 QPM process (`defwp`) | 125 to 250 MB resident, 11 threads |
+| A v2 Margo QPM process | 120 to 140 MB resident, 20 threads |
+| The SDK in a client process, `otlp` profile on | +29 MB resident and +0.3 s at start: 6 MB and 0.06 s for the imports, 23 MB and 0.25 s for `configure()`, on a bind-mounted venv |
+
+Margo costs threads, its progress and handler pools, not memory. Telemetry
+costs an instrumented process about 29 MB once, plus the per-job overhead in
+the budget above; with the profile off the SDK is never imported and the
+cost is zero.
+
+In storage, after 1,830 jobs in twelve hours with full tracing, Prometheus
+held 45 MB and Tempo 5 MB, so a day of demonstration stays under 100 MB.
+Grafana's volume is 442 MB, of which 424 MB is the plugin directory it
+unpacks on first start.
+
+What it means for a site: QFw with the Margo path and the exporter is under
+20 MB over what the site already had, and the dashboards are four optional
+containers, half a gigabyte of memory and well under one core. The weight of
+the image is the build toolchains for MQT and QRMI, which a packaged release
+would not carry.
+
 ### Sampling and Signal Tiers
 
 Traces and metrics are not interchangeable, and the difference is not only
