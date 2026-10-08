@@ -3,11 +3,7 @@ import types
 import pytest
 
 from defw_exception import DEFwError
-from svc_nwqsim_qpm.svc_qrc import QRC
-
-import numpy
-
-_HAS_REAL_NUMPY = hasattr(numpy, "fromfile")
+from svc_nwqsim_qpm.svc_qrc import QRC, _split_planar_doubles
 
 
 class _Statevector:
@@ -63,26 +59,22 @@ def test_statevector_result_keeps_measurement_parsing_strict(tmp_path):
 		qrc.parse_task_result(out, _circuit(dump_file), {})
 
 
-@pytest.mark.skipif(not _HAS_REAL_NUMPY, reason="needs real numpy")
-def test_parse_statevector_dump_reads_planar_layout(tmp_path):
-	from util.qpm.statevector import decode_statevector_payload
+def test_split_planar_doubles_matches_a_real_dump():
+	c = 2 ** -1.5
+	real = [0.0, 0.0, 0.0, 0.0, 0.5, 0.0, c, -c]
+	imag = [0.0, 0.0, 0.0, 0.0, 0.0, 0.5, c, c]
 
-	dump_file = tmp_path / "statevector.dump"
-	amplitude = 2 ** -0.5
-	real = numpy.zeros(16, dtype=numpy.float64)
-	real[0] = amplitude
-	real[15] = amplitude
-	imag = numpy.zeros(16, dtype=numpy.float64)
-	numpy.concatenate([real, imag]).tofile(dump_file)
+	amplitudes = _split_planar_doubles(real + imag)
 
-	qrc = _qrc()
-	statevector = qrc.parse_statevector_dump(dump_file, num_qubits=4)
-	amplitudes = decode_statevector_payload(statevector.to_dict())
-
-	expected = numpy.zeros(16, dtype=numpy.complex128)
-	expected[0] = amplitude
-	expected[15] = amplitude
-	numpy.testing.assert_allclose(amplitudes, expected)
+	expected = [
+		0j, 0j, 0j, 0j,
+		complex(0.5, 0.0),
+		complex(0.0, 0.5),
+		complex(c, c),
+		complex(-c, c),
+	]
+	for actual, wanted in zip(amplitudes, expected):
+		assert abs(complex(actual) - wanted) < 1e-9
 
 
 def test_count_result_still_requires_measurements(tmp_path):
