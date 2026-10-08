@@ -73,6 +73,15 @@ DEFAULT_TELEMETRY_DIRNAME = "qfw-telemetry"
 DEFAULT_METRIC_EXPORT_INTERVAL_MS = 10_000
 METRIC_EXPORT_INTERVAL_ENV = "OTEL_METRIC_EXPORT_INTERVAL"
 
+# Bucket boundaries for the duration histograms, in seconds. The SDK's
+# default boundaries (5, 10, 25, ... 10000) are sized for milliseconds, so
+# every sub-second hop of a job would land in the first bucket and a quantile
+# over them would say nothing. These run from a tenth of a millisecond, the
+# cost of an RPC, to ten minutes, a long provider queue.
+DURATION_BUCKETS = (
+	0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1,
+	0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 25.0, 60.0, 120.0, 300.0, 600.0)
+
 try:
 	from opentelemetry import trace as _trace
 	from opentelemetry import metrics as _metrics
@@ -497,8 +506,16 @@ def duration_histogram(name):
 	with _LOCK:
 		instrument = _STATE.histograms.get(name)
 		if instrument is None:
-			instrument = _STATE.meter.create_histogram(
-				name, unit="s", description=f"{name} duration in seconds")
+			description = f"{name} duration in seconds"
+			try:
+				instrument = _STATE.meter.create_histogram(
+					name, unit="s", description=description,
+					explicit_bucket_boundaries_advisory=list(DURATION_BUCKETS))
+			except TypeError:
+				# An API older than 1.23 has no advisory parameter and keeps
+				# the SDK's default boundaries.
+				instrument = _STATE.meter.create_histogram(
+					name, unit="s", description=description)
 			_STATE.histograms[name] = instrument
 		return instrument
 

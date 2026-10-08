@@ -212,6 +212,11 @@ an interval, and a process that dies on a signal runs no shutdown. The QPM
 flushes through `shutdown()` on its own clean stop; anything it had not
 exported when it was killed is gone, bounded by the export interval above.
 
+**Duration histograms use second-scale buckets.** `duration_histogram()`
+asks for `DURATION_BUCKETS`, from a tenth of a millisecond to ten minutes,
+because the SDK's defaults are sized for milliseconds and would put every
+sub-second hop in one bucket.
+
 **Span rates must stay bounded per job.** The per-job budget above only holds
 if no span is emitted per unit of waiting. This is why `qfw.backend.collect`
 is one span per job with polls recorded as span events, rather than one span
