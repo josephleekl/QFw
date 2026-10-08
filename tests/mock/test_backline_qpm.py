@@ -295,3 +295,11 @@ def test_gpu_coprocessor_matched_when_intent_asks_for_gpu(
 		coprocessors=[{"role": "qec_decoder", "kind": "gpu", "decoder": "steane"}]))
 	assert decision["status"] == "accepted", decision
 	assert decision["placement"]["coprocessors"][0]["hardware"] == "gpu"
+
+
+def test_inventory_controller_without_device_lib_is_refused_at_load(
+		monkeypatch, tmp_path):
+	monkeypatch.setattr(sys.modules[__name__], "INVENTORY", INVENTORY.replace(
+		"    device_lib: librtd_null_qubit.so\n", ""))
+	with pytest.raises(ValueError, match="device_lib"):
+		_qpm(monkeypatch, tmp_path)

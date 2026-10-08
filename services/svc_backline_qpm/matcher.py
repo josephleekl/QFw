@@ -55,6 +55,11 @@ def load_inventory(path):
 			raise FileNotFoundError(
 				f"decoder {decoder['id']!r}: library not found: "
 				f"{decoder['lib']}")
+	for ctrl in inventory.get("controller", []):
+		missing = [k for k in ("device", "device_lib") if not ctrl.get(k)]
+		if missing:
+			raise ValueError(
+				f"controller {ctrl.get('id')!r} in {path} lacks {missing}")
 	return inventory
 
 
