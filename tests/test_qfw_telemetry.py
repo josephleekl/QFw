@@ -76,6 +76,22 @@ def test_metric_export_interval_defaults_short_and_honours_otel_env(
             telemetry._metric_export_interval_ms()
 
 
+def test_otlp_endpoint_names_the_collector_not_the_signal(monkeypatch):
+    # An endpoint handed to the OTLP/HTTP exporters is used verbatim, so the
+    # signal path has to be appended here or the collector answers 404.
+    monkeypatch.delenv(telemetry.TELEMETRY_ENDPOINT_ENV, raising=False)
+    assert telemetry._otlp_endpoint("v1/traces") is None
+    for value in ("http://otel-collector:4318", "http://otel-collector:4318/"):
+        monkeypatch.setenv(telemetry.TELEMETRY_ENDPOINT_ENV, value)
+        assert telemetry._otlp_endpoint("v1/traces") == \
+            "http://otel-collector:4318/v1/traces"
+        assert telemetry._otlp_endpoint("v1/metrics") == \
+            "http://otel-collector:4318/v1/metrics"
+    monkeypatch.setenv(
+        telemetry.TELEMETRY_ENDPOINT_ENV, "http://c:4318/v1/traces")
+    assert telemetry._otlp_endpoint("v1/traces") == "http://c:4318/v1/traces"
+
+
 def test_export_dir_prefers_explicit_setting(monkeypatch, tmp_path):
     monkeypatch.setenv(telemetry.TELEMETRY_DIR_ENV, str(tmp_path))
     assert telemetry._export_dir() == str(tmp_path)

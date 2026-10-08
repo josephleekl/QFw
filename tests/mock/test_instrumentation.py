@@ -189,6 +189,9 @@ def test_qpm_run_is_one_trace_with_every_hop(monkeypatch, tmp_path, recording):
 		"qfw.outcome": "completed",
 	}
 	assert point.count == 1
+	# Buckets sized for seconds, not the SDK's millisecond defaults, so a
+	# quantile over sub-second hops means something.
+	assert list(point.explicit_bounds) == list(qfw_telemetry.DURATION_BUCKETS)
 	for attributes, _ in qpm_points + backend_points:
 		assert "qfw.qpm.cid" not in attributes
 		assert "qfw.reservation.id" not in attributes
