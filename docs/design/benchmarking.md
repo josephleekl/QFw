@@ -421,10 +421,57 @@ which is not the Python version or the distribution any given deployment
 runs, so treat them as the right order of magnitude rather than as exact.
 They are single-threaded, so they do not capture the batch export thread
 contending for the GIL under concurrent load, which is the most likely way a
-real deployment comes out worse than this table. Re-measuring in the target
-environment is a Phase 1 deliverable, together with an
-instrumented-versus-uninstrumented delta on a real workload and a budget
-that later changes are checked against.
+real deployment comes out worse than this table. The re-measurement in the
+target environment that Phase 1 asked for follows.
+
+#### Measured in the target environment, October 2026: the budget
+
+The instrumented-versus-uninstrumented delta on the QFw-SLURM-Cluster
+reference deployment (the image of 2026-10-07: Rocky Linux 10 on an arm64
+Docker VM, CPython 3.12, `opentelemetry-sdk` 1.45.1 in the service plane and
+1.44.0 in the client's venv), through the production path: a Qiskit client
+in a Slurm allocation, the site fake IQM QPM, and this design's collector
+profile receiving OTLP over HTTP.
+
+Workload: `examples/qfw_job_stream.sh --service-mode site --backend fake-iqm
+--jobs 300 --interval 0 --qubits 3 --circuits ghz --shots 100`, one worker:
+300 identical three-qubit GHZ jobs back to back. The fake IQM executes a
+job in about a millisecond, which makes this the fastest job the framework
+can run and the relative overhead a worst case. Three telemetry states,
+three repetitions each, interleaved, the QPM restarted into each state.
+Latency and client CPU come from the stream's own summary, the QPM's CPU
+from `/proc`. Medians of the three repetitions:
+
+| State | p50 per job | p95 per job | Client CPU per job | QPM CPU per job |
+| --- | --- | --- | --- | --- |
+| Off (`QFW_TELEMETRY` unset): every call site a boolean test | 10.84 ms | 12.02 ms | 7.42 ms | 7.20 ms |
+| Metrics on, traces sampled off: the production default | 11.11 ms (+0.27) | 12.59 ms | 7.89 ms (+0.47) | 7.57 ms (+0.37) |
+| Metrics and traces on: a benchmark or a demonstration | 11.17 ms (+0.33) | 12.91 ms | 7.97 ms (+0.54) | 7.70 ms (+0.50) |
+
+On the fastest job the framework can run, the production default adds
+about 0.3 ms of latency (2.5%) and about 0.85 ms of CPU across the two
+processes (6%); full tracing adds about 0.35 ms and 1.05 ms. Against a job
+on a real device, one to four seconds, that is 0.01% to 0.03% of the job:
+the order of magnitude the table above predicted, at three to five times its
+55 to 123 µs, which is what the attributes, the phase spans written after
+the fact and the export work on a busy service cost over the bare call
+sites. Two things the microbenchmarks could not show: bringing the providers
+up costs a client process about 85 ms once, the SDK and exporter imports,
+and nothing with telemetry off; and metrics-only and full tracing differ by
+little (0.06 ms of latency, 0.13 ms of QPM CPU per job), because a sampled-out
+span still runs its call site, so turning traces off buys little on the job
+path and the metrics tier is the one to keep on.
+
+**The budget.** On this workload, the production default may cost up to
+0.5 ms of p50 latency and 1.5 ms of combined CPU per job over telemetry off,
+and full tracing up to 0.6 ms and 1.8 ms. A change to the instrumentation
+that goes past that needs a reason rather than a re-argument. The harness is
+`telemetry/overhead-budget.sh` in the QFw-SLURM-Cluster repository; it
+prints this table for the tree it is run against.
+
+Means are not in the table because each run's first job carries the
+backend's construction and connection, five to six seconds, and dominates
+them. p50 and CPU per job are the statistics to compare.
 
 ### Sampling and Signal Tiers
 
@@ -921,8 +968,9 @@ histogram the tables above name. The conventions layer the call sites use is
 provider bootstrap. One sequencing change: the collector-profile reference
 deployment from Phase 4 comes next, ahead of `qfw_bench_extract`, because a
 live dashboard of a running deployment is wanted before an archival report
-is. The overhead budget this phase's exit criterion asks for is still to be
-measured on the instrumented tree.
+is. The overhead budget was measured on 2026-10-08 and is recorded under
+[Instrumentation Cost](#instrumentation-cost), so Phase 1's exit criteria
+are met.
 
 ## Open Questions and Community Input
 
