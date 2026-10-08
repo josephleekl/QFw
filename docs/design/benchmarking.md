@@ -25,6 +25,11 @@ for production readiness:
 - **Phases are sequenced production-first.** Phase 1 is the lean slice that
   makes overhead work possible, the per-hop duration histograms move into it
   from phase 3, and phases 2 to 5 are explicitly deferred behind remediation.
+- **The transport extension has call sites** (October 2026). Three of them,
+  on the job path rather than inside DEFw, because the first dashboards
+  showed the job-path spans accounting for 4 ms of a 27 ms job and the
+  question "where is the rest" needed an answer the trace could give. See
+  [Optional Extension: Transport Profiling](#optional-extension-transport-profiling).
 
 Revision 3 incorporates the second round of review feedback (PR #30):
 
@@ -324,8 +329,16 @@ run. A run is not the same thing as one application invocation: a sweep
 across qubit counts, or the same circuit across `native`, `qrmi`, and
 `qdmi`, is one run and many jobs.
 
-DEFw RPC round-trips can additionally be recorded as `qfw.transport.rpc`
-spans. That is an optional extension, off by default. See
+What the tree leaves out is the transport between the two processes: the
+run RPC on the way in and the completion event on the way back. On a fast
+job that is most of the client's time. On the reference cluster a fake-IQM
+job takes 27 ms end to end of which the spans above cover 4 ms; the other
+23 ms is the two legs, roughly half each. The optional transport extension
+covers them, off by default: `qfw.transport.rpc` around the client's run
+RPC and around the QPM's push of the completion event, and
+`qfw.transport.return` from the provider's completion to the client's
+receipt. With it on, the QPM's spans nest under the client's run RPC, which
+is where they happen. See
 [Optional Extension: Transport Profiling](#optional-extension-transport-profiling).
 
 ### Trace-Context Propagation Through DEFw RPC
@@ -666,7 +679,18 @@ implement it.
 
 | Span | Emitted by | Measures |
 | --- | --- | --- |
-| `qfw.transport.rpc` | DEFw | One RPC round-trip. Attributes: byte counts, and `qfw.transport.kind` = `tcp` \| `ofi` |
+| `qfw.transport.rpc` | the job path, `qfw.transport.op` = `submit` \| `event` | One RPC round-trip as its caller sees it: `submit` is the client's run request, around the QPM's receive; `event` is the QPM's push of the completion event to the client |
+| `qfw.transport.return` | front end (`qfw_qiskit`), written after the fact | From the provider's completion of the circuit, the `completion_time` on its result, to the client picking the completion event up: the QRC's result assembly, the QPM's publish, the event RPC and the client's wake-up. Two clocks; a negative window is dropped |
+| `qfw.transport.rpc` | DEFw, reserved | One transport-level round-trip, when DEFw itself emits. Attributes: byte counts, and `qfw.transport.kind` = `tcp` \| `ofi` |
+
+The first two rows are implemented (October 2026), at three call sites:
+the client's run RPC and its receipt of the result in `qfw_qiskit`, and
+the completion-event push in the QPM's controller. They sit on the job
+path, one of each per circuit, so they are bounded-rate; they are still
+flag-guarded, with `QFW_TELEMETRY_TRANSPORT=1`, because they measure the
+framework rather than the job and a Type A comparison must not carry them.
+The third row is where DEFw's own transport work plugs in, and stays
+reserved until it does.
 
 Rationale for keeping it out of the core set. It is the only span in the
 vocabulary that describes a QFw implementation detail rather than a stage of
@@ -753,7 +777,8 @@ the **dimensional** class above:
 | `qfw.app.job.count` | counter | outcome, api path, device | Throughput and reliability under load |
 | `qfw.qpm.duration` | histogram | `qfw.qpm.op` = `receive` \| `transpile` \| `queue` \| `dispatch`; `receive` also carries `qfw.qpm.request` = `async_run` \| `sync_run`, because a synchronous request spans the whole run | Framework overhead attribution per QPM stage, without depending on trace sampling |
 | `qfw.backend.duration` | histogram | `qfw.backend.op` = `execute` \| `acquire` \| `submit` \| `collect`, plus api path, device, backend kind and outcome | Back-end cost per stage, and `execute` for the whole interaction so a dashboard needs no sum. Carries the Type A API-path comparison when traces are sampled off |
-| `qfw.transport.rpc.duration`, `qfw.transport.rpc.bytes` | histogram | `qfw.transport.kind` | Transport characterization (libfabric work). Optional extension, off by default |
+| `qfw.transport.duration` | histogram | `qfw.transport.op` = `submit` \| `event` \| `return` | The two legs between the processes and the way back, so a dashboard's per-hop view adds up to the client's end to end. Optional extension, off by default |
+| `qfw.transport.rpc.bytes` | histogram | `qfw.transport.kind` | Transport characterization (libfabric work). Reserved for DEFw's own emission |
 
 Two conventions hold for this set. Metric names mirror the span they
 aggregate, so moving between a trace view and a dashboard needs no

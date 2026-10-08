@@ -303,6 +303,8 @@ def test_qiskit_job_is_the_trace_root_and_counts_itself(monkeypatch, recording):
 	(count,) = recording.points("qfw.app.job.count")
 	assert count[0] == duration[0]
 	assert count[1].value == 1
+	# The transport extension is off unless asked for: no span, no metric.
+	assert recording.points("qfw.transport.duration") == []
 
 
 def test_failed_submission_closes_the_job_as_failed(monkeypatch, recording):
@@ -319,6 +321,123 @@ def test_failed_submission_closes_the_job_as_failed(monkeypatch, recording):
 	(count,) = recording.points("qfw.app.job.count")
 	assert count[0]["qfw.outcome"] == "failed"
 	assert count[1].value == 1
+
+
+def _transport_on(monkeypatch):
+	# The flag is read from the environment when providers are adopted, so
+	# the recording fixture has already decided it; flip the state directly.
+	monkeypatch.setattr(qfw_telemetry._STATE, "transport_spans", True)
+
+
+def test_transport_spans_cover_the_way_in_and_the_way_back(monkeypatch, recording):
+	_transport_on(monkeypatch)
+	fake_qpm = _TracingFakeQPM(cids=["cid-1"])
+	completed = time.time() - 0.02
+	circuit, job = _client_job(
+		monkeypatch, fake_qpm,
+		[make_result_event("cid-1", {"00": 2, "11": 1}, offset=completed - 5.0)])
+	job.submit()
+	assert job.result().get_counts(circuit) == {"00": 2, "11": 1}
+
+	spans = recording.spans_by_name()
+	assert set(spans) == {
+		"qfw.app.job", "qfw.app.prepare",
+		"qfw.transport.rpc", "qfw.transport.return"}
+	(root,) = spans["qfw.app.job"]
+	(rpc,) = spans["qfw.transport.rpc"]
+	(back,) = spans["qfw.transport.return"]
+
+	# The run RPC: inside the job, and current when the RPC was made, so on
+	# a real deployment the QPM's receive nests under it.
+	assert rpc.parent.span_id == root.context.span_id
+	assert rpc.attributes["qfw.transport.op"] == "submit"
+	assert rpc.attributes["qfw.outcome"] == "completed"
+	assert fake_qpm.contexts == [rpc.context]
+
+	# The way back, written after the fact: from the provider's completion
+	# clock to the client's pick-up, as a child of the job.
+	assert back.parent.span_id == root.context.span_id
+	assert back.attributes["qfw.transport.op"] == "return"
+	assert back.attributes["qfw.qpm.cid"] == "cid-1"
+	assert back.start_time == int(completed * 1_000_000_000)
+	assert back.end_time >= back.start_time + 20_000_000
+
+	points = recording.points("qfw.transport.duration")
+	assert {a["qfw.transport.op"] for a, _ in points} == {"submit", "return"}
+	back_point = next(p for a, p in points if a["qfw.transport.op"] == "return")
+	assert back_point.count == 1
+	assert back_point.sum >= 0.02
+	# Labelled like the job's own metrics, so a dashboard can filter by
+	# device, and nothing per-job on a label.
+	for attributes, _ in points:
+		assert attributes["qfw.device.name"] == FAKE_IQM_TARGET_ID
+		assert attributes["qfw.backend.kind"] == "fake-iqm"
+		assert "qfw.qpm.cid" not in attributes
+
+
+class _RecordingEndpoint:
+	"""Stands in for the client's remote event API, the thing the QPM pushes to."""
+	instances = []
+
+	def __init__(self, class_id=None, target=None, **kwargs):
+		self.target = target
+		self.events = []
+		self.contexts = []
+		_RecordingEndpoint.instances.append(self)
+
+	def put(self, event):
+		from opentelemetry import trace
+		self.contexts.append(trace.get_current_span().get_span_context())
+		self.events.append(event)
+
+
+@pytest.mark.filterwarnings(
+	"error::pytest.PytestUnhandledThreadExceptionWarning")
+def test_event_push_joins_the_job_trace_when_transport_is_on(monkeypatch, tmp_path, recording):
+	import util.qpm.util_qpm as util_qpm
+
+	_transport_on(monkeypatch)
+	_setup(monkeypatch)
+	configure_fake_credentials(monkeypatch, tmp_path, "trace-user")
+	monkeypatch.setattr(util_qpm, "BaseEventAPI", _RecordingEndpoint)
+	_RecordingEndpoint.instances.clear()
+	qpm = _fake_iqm_qpm()
+	decision = _reserve(qpm, "trace-user")
+	qpm.register_event_notification("client-endpoint", 1, "client-class")
+
+	with qfw_telemetry.tracer().start_as_current_span("qfw.app.job") as job:
+		response = qpm.async_run(
+			dict(_CIRCUIT), reservation_id=decision["reservation_id"])
+	completion = _wait_for_completion(
+		qpm, response["cid"], decision["reservation_id"])
+	assert completion["outcome"] == "COMPLETED"
+	(endpoint,) = _RecordingEndpoint.instances
+	deadline = time.monotonic() + 1.0
+	while not endpoint.events and time.monotonic() < deadline:
+		time.sleep(0.01)
+	assert len(endpoint.events) == 1
+
+	# The push ran in the run queue's thread after the receive handler had
+	# returned, and still joined the job's trace under the receive span.
+	spans = recording.spans_by_name()
+	(push,) = spans["qfw.transport.rpc"]
+	(receive,) = spans["qfw.qpm.receive"]
+	assert push.attributes["qfw.transport.op"] == "event"
+	assert push.attributes["qfw.outcome"] == "completed"
+	assert push.context.trace_id == job.get_span_context().trace_id
+	assert push.parent.span_id == receive.context.span_id
+	assert endpoint.contexts == [push.context]
+
+	points = recording.points("qfw.transport.duration")
+	assert [a["qfw.transport.op"] for a, _ in points] == ["event"]
+
+
+def test_transport_return_skips_a_window_the_clocks_disagree_on(monkeypatch, recording):
+	_transport_on(monkeypatch)
+	# A completion stamped in the future, as a skewed provider clock would.
+	instrumentation.record_transport_return({"cid": "cid-2", "completion_time": time.time() + 60})
+	assert recording.spans_by_name() == {}
+	assert recording.points("qfw.transport.duration") == []
 
 
 def test_everything_is_inert_with_telemetry_off():
