@@ -13,9 +13,8 @@ INVENTORY = """
 controller:
   - id: local-cpu-ctrl
     hardware: cpu
-    devices:
-      - null.qubit
-    max_wires: 64
+    device: null.qubit
+    device_lib: librtd_null_qubit.so
     transports:
       - memcpy
 coprocessor:
@@ -168,3 +167,10 @@ def test_expired_reservation_frees_components(monkeypatch, tmp_path):
 		reservation_id=first["reservation_id"])
 	second = qpm.reserve(request=_request("job-b"))
 	assert second["status"] == "accepted", second
+
+
+def test_admission_profile_uses_the_qpm_qubit_limit(monkeypatch, tmp_path):
+	from svc_backline_qpm.svc_qpm import MAX_QUBITS
+	qpm = _qpm(monkeypatch, tmp_path)
+	profile = qpm.controller.admission_context.registered_profiles[-1]
+	assert profile["max_qubits"] == MAX_QUBITS == 3

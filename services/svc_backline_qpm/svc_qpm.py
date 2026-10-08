@@ -15,6 +15,10 @@ BACKLINE_PROVIDER = "backline"
 BACKLINE_TARGET_ID = "backline-local"
 DEFAULT_INVENTORY = Path(__file__).with_name("inventory.yaml")
 
+# QFw admission limit for this QPM, in logical qubits. A policy value, not a
+# device property; qhw-admission requires it > 0 and rejects larger requests.
+MAX_QUBITS = 3
+
 # Applied when a reserve request carries no resource_intent, as from the
 # qfw-slurm gateway: there the selected service name is the intent.
 DEFAULT_INTENT = {
@@ -76,9 +80,6 @@ class QPM(UTIL_QPM):
 			os.environ.get("QFW_BACKLINE_INVENTORY") or DEFAULT_INVENTORY)
 		self._placements = {}
 		self._placement_lock = threading.Lock()
-		max_qubits = max(
-			(c["max_wires"] for c in self.inventory.get("controller", [])),
-			default=0)
 		super().__init__(
 			QRC(start=start),
 			max_ppn=1,
@@ -86,11 +87,11 @@ class QPM(UTIL_QPM):
 			target_id=BACKLINE_TARGET_ID,
 			admission_context_factory=admission_context_factory,
 			scheduler_context_factory=scheduler_context_factory)
-		set_max_qubits_pp(max_qubits)
+		set_max_qubits_pp(MAX_QUBITS)
 		device_id = self.controller.canonicalize_external_id(
 			"device_id", BACKLINE_TARGET_ID)
 		self.configure_device_profile(
-			profile=backline_profile(device_id, max_qubits))
+			profile=backline_profile(device_id, MAX_QUBITS))
 
 	def query(self):
 		from . import SERVICE_NAME, SERVICE_DESC, svc_info

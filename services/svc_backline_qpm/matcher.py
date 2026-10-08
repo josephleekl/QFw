@@ -5,8 +5,8 @@
 # inventory entries that satisfy the intent and returns the placement the
 # client builds its Backline nodes from. Nothing else in QFw reads either.
 #
-# Matching order, first failure wins: QEC code, controller (kind, logical
-# qubits), per coprocessor decoder + transport + latency, then capacity.
+# Matching order, first failure wins: QEC code, controller kind, per
+# coprocessor decoder + transport + latency, then capacity.
 
 import importlib.util
 import os
@@ -103,10 +103,10 @@ def match(inventory, intent, qubit_count, busy):
 			     f"qec code {code!r} is not offered; supported: {codes}")
 
 	ctrls = [c for c in inventory.get("controller", [])
-		 if kind in (None, c["hardware"]) and c["max_wires"] >= qubit_count]
+		 if kind in (None, c["hardware"])]
 	if not ctrls:
 		raise Reject("no-matching-controller",
-			     f"no controller of kind {kind!r} with {qubit_count} wires")
+			     f"no controller of kind {kind!r}")
 
 	if transport is not None:
 		return _match_on(inventory, transport, ctrls, wanted, code, limit,
@@ -186,7 +186,7 @@ def _match_on(inventory, transport, ctrls, wanted, code, limit, qubit_count,
 	placement = {
 		"version": PLACEMENT_VERSION,
 		"controller": {"name": ctrl["id"], "hardware": ctrl["hardware"],
-			       "device": {"name": ctrl["devices"][0],
+			       "device": {"name": ctrl["device"],
 					  "wires": qubit_count}},
 		"coprocessors": [
 			{"name": c["id"], "hardware": c["hardware"],

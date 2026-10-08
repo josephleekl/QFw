@@ -8,9 +8,8 @@
 controller:
   - id: local-cpu-ctrl
     hardware: cpu
-    devices:
-      - null.qubit
-    max_wires: 64
+    device: null.qubit
+    device_lib: librtd_null_qubit.so     # plugin the executor loads for this simulator
     transports:
       - memcpy
 
