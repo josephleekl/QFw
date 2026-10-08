@@ -35,13 +35,16 @@ def _default_catalyst_lib():
 	return str(Path(list(spec.submodule_search_locations)[0]) / "lib")
 
 
+def catalyst_lib():
+	return os.environ.get("CATALYST_LIB") or _default_catalyst_lib()
+
+
 def load_inventory(path):
 	# ${VAR} is expanded from the environment. CATALYST_LIB defaults to the
 	# installed catalyst package's lib/ directory, where the wheel ships the
 	# precompiled decoders.
 	env = dict(os.environ)
-	if not env.get("CATALYST_LIB"):
-		env["CATALYST_LIB"] = _default_catalyst_lib()
+	env["CATALYST_LIB"] = catalyst_lib()
 	try:
 		text = string.Template(Path(path).read_text()).substitute(env)
 	except KeyError as e:

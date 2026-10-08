@@ -5,7 +5,9 @@ import threading
 import time
 from pathlib import Path
 
-from .matcher import Reject, capabilities, load_inventory, match, rejected
+from . import executors
+from .matcher import (Reject, capabilities, catalyst_lib, load_inventory,
+		      match, rejected)
 from .svc_qrc import QRC
 from util.qpm.admission import normalize_reservation_id
 from util.qpm.util_circuit import set_max_qubits_pp
@@ -18,16 +20,6 @@ DEFAULT_INVENTORY = Path(__file__).with_name("inventory.yaml")
 # QFw admission limit for this QPM, in logical qubits. A policy value, not a
 # device property; qhw-admission requires it > 0 and rejects larger requests.
 MAX_QUBITS = 3
-
-# Applied when a reserve request carries no resource_intent, as from the
-# qfw-slurm gateway: there the selected service name is the intent.
-DEFAULT_INTENT = {
-	"version": 1,
-	"controller": {"role": "qpu_control"},
-	"coprocessors": [{"role": "qec_decoder"}],
-	"qec": {"code": "steane"},
-}
-
 
 def backline_profile(device_id, max_qubits):
 	# Admission timing model. ponytail: placeholder costs from the fake IQM
@@ -75,11 +67,13 @@ def _active(reservation):
 
 class QPM(UTIL_QPM):
 	def __init__(self, start=True, admission_context_factory=None,
-		     scheduler_context_factory=None):
+		     scheduler_context_factory=None, executor_launcher=None):
 		self.inventory = load_inventory(
 			os.environ.get("QFW_BACKLINE_INVENTORY") or DEFAULT_INVENTORY)
 		self._placements = {}
 		self._placement_lock = threading.Lock()
+		self._launcher = executor_launcher or executors
+		self._executors = {}
 		super().__init__(
 			QRC(start=start),
 			max_ppn=1,
@@ -117,20 +111,32 @@ class QPM(UTIL_QPM):
 
 	def evaluate(self, token=None, request=None):
 		if isinstance(request, dict):
-			request, intent = self._split(request)
-			try:
-				match(self.inventory, intent, self._qubits(request),
-				      self._busy())
-			except Reject as r:
-				return rejected(r.reason, str(r))
+			request = dict(request)
+			request.pop("for_reservation", None)
+			intent = request.pop("resource_intent", None)
+			if intent is not None:
+				try:
+					with self._placement_lock:
+						match(self.inventory, intent,
+						      self._qubits(request), self._busy())
+				except Reject as r:
+					return rejected(r.reason, str(r))
 		return super().evaluate(token=token, request=request)
 
 	def reserve(self, token=None, request=None):
 		if not isinstance(request, dict):
 			return super().reserve(token=token, request=request)
-		request, intent = self._split(request)
-		# Hold the lock across match and commit so two reserves cannot be
-		# placed on the same inventory entry.
+		request = dict(request)
+		intent = request.pop("resource_intent", None)
+		target = request.pop("for_reservation", None)
+		if target is not None:
+			return self._classical_request(token, target, request, intent)
+		if intent is None:
+			# qfw-slurm gateway: the quantum budget only. The application
+			# requests its classical QEC resources against this reservation.
+			return super().reserve(token=token, request=request)
+		# Direct client: quantum and classical in one request. Hold the lock
+		# across match and commit so two reserves cannot share an entry.
 		with self._placement_lock:
 			try:
 				placement, entries = match(
@@ -142,16 +148,19 @@ class QPM(UTIL_QPM):
 			if decision.get("status") != "accepted":
 				return decision
 			rid = normalize_reservation_id(decision["reservation_id"])
-			self._placements[rid] = (placement, entries)
-		return dict(decision, placement=copy.deepcopy(placement))
+			try:
+				placement = self._attach(rid, placement, entries)
+			except executors.ExecutorStartError as e:
+				super().release(token=token, reservation_id=rid)
+				return rejected("executor-start-failed", str(e))
+		return dict(decision, placement=placement)
 
 	def release(self, token=None, reservation_id=None, reason=None):
 		result = super().release(
 			token=token, reservation_id=reservation_id, reason=reason)
 		if result.get("status") == "accepted":
 			with self._placement_lock:
-				self._placements.pop(
-					normalize_reservation_id(reservation_id), None)
+				self._drop(normalize_reservation_id(reservation_id))
 		return result
 
 	def get_reservation(self, token=None, reservation_id=None):
@@ -162,13 +171,77 @@ class QPM(UTIL_QPM):
 			reservation["placement"] = copy.deepcopy(held[0])
 		return reservation
 
+	def shutdown_provider(self):
+		with self._placement_lock:
+			for rid in list(self._executors):
+				self._drop(rid)
+		super().shutdown_provider()
+
 	# ------------------------------------------------------------ internals
 
-	@staticmethod
-	def _split(request):
-		request = dict(request)
-		intent = request.pop("resource_intent", None)
-		return request, DEFAULT_INTENT if intent is None else intent
+	def _classical_request(self, token, target, request, intent):
+		# The application's request for classical QEC resources against an
+		# existing (e.g. Slurm-made) reservation.
+		if intent is None:
+			return rejected("invalid-request",
+					"for_reservation needs a resource_intent")
+		with self._placement_lock:
+			try:
+				rid = normalize_reservation_id(target)
+				reservation = super().get_reservation(
+					token=token, reservation_id=rid)
+			except Exception as e:
+				return rejected("invalid-request",
+						f"unknown reservation {target!r}: {e}")
+			if not _active(reservation):
+				return rejected("invalid-request",
+						f"reservation {rid} is not active")
+			if rid in self._placements:
+				return rejected(
+					"invalid-request",
+					f"reservation {rid} already has classical resources")
+			meta = reservation.get("request_metadata") or {}
+			for want, have, what in (
+					((request.get("owner") or {}).get("user"),
+					 (meta.get("owner") or {}).get("user"), "owner"),
+					(request.get("job_id"), meta.get("external_job_id"),
+					 "job")):
+				if want and have and str(want) != str(have):
+					return rejected(
+						"invalid-request",
+						f"reservation {rid} belongs to another {what}")
+			qubits = self._qubits(meta) or self._qubits(request)
+			try:
+				placement, entries = match(
+					self.inventory, intent, qubits, self._busy())
+			except Reject as r:
+				return rejected(r.reason, str(r))
+			try:
+				placement = self._attach(rid, placement, entries)
+			except executors.ExecutorStartError as e:
+				return rejected("executor-start-failed", str(e))
+		return {"status": "accepted", "reservation_id": rid,
+			"placement": placement}
+
+	def _attach(self, rid, placement, entries):
+		# Start this reservation's executor and put its address on every node.
+		ctrl = next(c for c in self.inventory["controller"]
+			    if c["id"] == placement["controller"]["name"])
+		plugins = list(executors.RUNTIME_PLUGINS) + [ctrl["device_lib"]] + [
+			p["function"]["lib_path"] for p in placement["coprocessors"]]
+		running = self._launcher.start(catalyst_lib(), plugins)
+		placement = copy.deepcopy(placement)
+		for node in (placement["controller"], *placement["coprocessors"]):
+			node["executor"] = {"address": running.address}
+		self._placements[rid] = (placement, entries)
+		self._executors[rid] = running
+		return copy.deepcopy(placement)
+
+	def _drop(self, rid):
+		self._placements.pop(rid, None)
+		running = self._executors.pop(rid, None)
+		if running is not None:
+			self._launcher.stop(running)
 
 	@staticmethod
 	def _qubits(request):
@@ -178,11 +251,12 @@ class QPM(UTIL_QPM):
 
 	def _busy(self):
 		# Entries held by reservations that are still active. Expired or
-		# released ones are dropped here, so capacity frees lazily.
+		# released ones are dropped here (stopping their executors), so
+		# capacity frees lazily. Callers hold _placement_lock.
 		busy = set()
 		for rid in list(self._placements):
 			if _active(super().get_reservation(reservation_id=rid)):
 				busy.update(self._placements[rid][1])
 			else:
-				self._placements.pop(rid, None)
+				self._drop(rid)
 		return busy
