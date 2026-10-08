@@ -29,8 +29,10 @@ from .base_driver import BaseDriver
 from .qdmi_profiles import profile_for
 from . import fomac_normalize
 from defw_exception import DEFwExecutionError
+from util import instrumentation
 import json
 import logging
+import sys
 import time
 
 
@@ -163,7 +165,8 @@ class QdmiDriver(BaseDriver):
 		# Braket), then it is submitted through QDMI's FoMaC job interface,
 		# polled to completion, and the counts are normalized to
 		# qhw-result-v1 (the same record the QRMI path produces).
-		device = self._device()
+		with instrumentation.backend_phase("acquire"):
+			device = self._device()
 		info = getattr(circuit, "info", None) or {}
 		cid = circuit.get_cid() if hasattr(circuit, "get_cid") else info.get("cid")
 		from util.circuit_payload import qiskit_input
@@ -174,8 +177,9 @@ class QdmiDriver(BaseDriver):
 		poll = float(info.get("poll_interval", 1.0))
 		provider, device_id = self._ids()
 
-		program, program_format, measurement = self._profile.encode(
-			self, source, info, device)
+		with instrumentation.qpm_transpile():
+			program, program_format, measurement = self._profile.encode(
+				self, source, info, device)
 
 		# Set by the shim QRC when the QPM cancels this circuit. A cancel that
 		# arrives before submission starts nothing at the provider.
@@ -200,15 +204,28 @@ class QdmiDriver(BaseDriver):
 
 		timing = {}
 		start = time.monotonic()
-		try:
-			job = device.submit_job(
-				program, fmt, int(shots), **self._profile.job_kwargs(info))
-		except Exception as exc:
-			raise DEFwExecutionError(f"QDMI submit_job failed: {exc}") from exc
+		with instrumentation.backend_phase("submit"):
+			try:
+				job = device.submit_job(
+					program, fmt, int(shots), **self._profile.job_kwargs(info))
+			except Exception as exc:
+				raise DEFwExecutionError(
+					f"QDMI submit_job failed: {exc}") from exc
 		timing["submit_seconds"] = time.monotonic() - start
 		queue_position = self._queue_position(job)
+		instrumentation.set_attribute(
+			instrumentation.ATTR_VENDOR_QUEUE_POSITION, queue_position)
 
-		status = self._poll_job(job, timeout, poll, cancel_event=cancel_event)
+		collect = instrumentation.backend_phase("collect")
+		collect.__enter__()
+		instrumentation.set_attribute(
+			instrumentation.ATTR_POLL_INTERVAL, float(poll))
+		try:
+			status = self._poll_job(
+				job, timeout, poll, cancel_event=cancel_event)
+		except BaseException:
+			collect.__exit__(*sys.exc_info())
+			raise
 		timing["wait_seconds"] = (
 			time.monotonic() - start - timing["submit_seconds"])
 		try:
@@ -223,7 +240,11 @@ class QdmiDriver(BaseDriver):
 			# it, but leave a trace rather than dropping it silently.
 			logging.debug("shim: QDMI job id unavailable: %s", exc)
 			job_id = None
+		instrumentation.set_attribute(
+			instrumentation.ATTR_VENDOR_JOB_ID,
+			None if job_id is None else str(job_id))
 		if status != "completed":
+			collect.__exit__(None, None, None)
 			self._last_job = {
 				"id": job_id, "status": status, "cid": cid,
 				"timing": timing, "shots": shots,
@@ -235,7 +256,9 @@ class QdmiDriver(BaseDriver):
 		try:
 			counts = job.get_counts()
 		except Exception as exc:
+			collect.__exit__(*sys.exc_info())
 			raise DEFwExecutionError(f"QDMI get_counts failed: {exc}") from exc
+		collect.__exit__(None, None, None)
 		timing["result_fetch_seconds"] = time.monotonic() - result_started
 		timing["total_wall_seconds"] = time.monotonic() - start
 		# QDMI keys a histogram by measured qubit, in the device library's
@@ -310,6 +333,7 @@ class QdmiDriver(BaseDriver):
 		# QFw has given up on it. The wait between polls ends as soon as a
 		# cancel arrives.
 		deadline = time.monotonic() + max(timeout, 0.0)
+		polls = 0
 		while True:
 			if cancel_event is not None and cancel_event.is_set():
 				self._cancel_job(job)
@@ -319,6 +343,9 @@ class QdmiDriver(BaseDriver):
 			except Exception as exc:
 				raise DEFwExecutionError(
 					f"QDMI job.check() failed: {exc}") from exc
+			polls += 1
+			instrumentation.add_event("poll", {"qfw.vendor.status": state})
+			instrumentation.set_attribute(instrumentation.ATTR_POLL_COUNT, polls)
 			if state == "done":
 				return "completed"
 			if state == "failed":

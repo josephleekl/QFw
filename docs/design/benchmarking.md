@@ -524,10 +524,10 @@ because revision 2 got both wrong:
 | `qfw.app.job` | front end (`qfw_qiskit`) | One circuit/job end to end, submission to result delivery |
 | `qfw.app.prepare` | `qfw_qiskit` | Getting the circuit into canonical submittable form: conversion to OpenQASM 3 and encoding. Payload size attribute |
 | `qfw.qpm.receive` | QPM service | Job arrival and admission at the QPM |
-| `qfw.qpm.transpile` | QPM service | QFw-side transpilation; pre/post circuit-statistics attributes |
+| `qfw.qpm.transpile` | QPM service, from inside its driver | QFw-side transpilation or transcoding into the provider's program; pre/post circuit-statistics attributes |
 | `qfw.qpm.queue` | QPM service | Time queued inside QFw before dispatch |
 | `qfw.qpm.dispatch` | QPM service (QRC) | In-process hand-off from the QPM's resource controller to the back-end driver |
-| `qfw.backend.execute` | back-end driver | Full back-end interaction; attribute `qfw.stack.api_path` = `native` \| `qrmi` \| `qdmi` \| `simulator` |
+| `qfw.backend.execute` | back-end driver | Full back-end interaction; attributes `qfw.stack.api_path` = `native` \| `qrmi` \| `qdmi` \| `simulator`, `qfw.device.name`, `qfw.backend.kind`, `qfw.outcome` = `completed` \| `failed` \| `cancelled` |
 | `qfw.backend.acquire` | back-end driver | Resource/session acquisition (QRMI `acquire`, QDMI session open, vendor connect) |
 | `qfw.backend.submit` | back-end driver | The submission call to the vendor/simulator |
 | `qfw.backend.collect` | back-end driver | Result retrieval, the complement of `qfw.backend.submit`. One span per job. Attributes `qfw.backend.poll_count` and `qfw.backend.poll_interval_s`; each poll is a span event |
@@ -622,8 +622,8 @@ Initial classification:
 
 | Class | Attributes |
 | --- | --- |
-| Dimensional | `qfw.stack.api_path` (`native`/`qrmi`/`qdmi`/`simulator`), `qfw.device.name`, `qfw.backend.kind`, `qfw.qpm.op`, `qfw.backend.op`, `qfw.transport.kind`, `qfw.suite.name`, `qfw.circuit.num_qubits`, `service.name`, `service.version`, status/outcome |
-| Descriptive | trace and span IDs, `qfw.job.id`, vendor job IDs, SLURM job ID, `qfw.device.calibration_set_id`, calibration snapshots, coupling maps, `target()` payload digests, circuit hashes, OpenQASM payloads, package-version maps, container image digests |
+| Dimensional | `qfw.stack.api_path` (`native`/`qrmi`/`qdmi`/`simulator`), `qfw.device.name`, `qfw.backend.kind`, `qfw.qpm.op`, `qfw.qpm.request`, `qfw.backend.op`, `qfw.outcome`, `qfw.transport.kind`, `qfw.suite.name`, `qfw.circuit.num_qubits`, `service.name`, `service.version` |
+| Descriptive | trace and span IDs, `qfw.job.id`, `qfw.qpm.cid`, `qfw.qpm.qtask_id`, `qfw.reservation.id`, vendor job IDs and queue positions (`qfw.vendor.*`), poll counts, SLURM job ID, `qfw.circuit.shots`, `qfw.circuit.payload_bytes`, `qfw.device.calibration_set_id`, calibration snapshots, coupling maps, `target()` payload digests, circuit hashes, OpenQASM payloads, package-version maps, container image digests |
 
 Two judgment calls worth community scrutiny (see open questions):
 `qfw.circuit.num_qubits` is dimensional in practice because sweeps use a
@@ -647,8 +647,8 @@ the **dimensional** class above:
 | `qfw.bench.iter.duration` | histogram | run label, api path | Per-iteration latency distribution for hybrid loops |
 | `qfw.app.job.duration` | histogram | api path, device, backend kind | End-to-end job latency distribution under load |
 | `qfw.app.job.count` | counter | outcome, api path, device | Throughput and reliability under load |
-| `qfw.qpm.duration` | histogram | `qfw.qpm.op` = `receive` \| `transpile` \| `queue` \| `dispatch` | Framework overhead attribution per QPM stage, without depending on trace sampling |
-| `qfw.backend.duration` | histogram | `qfw.backend.op` = `acquire` \| `submit` \| `collect`, plus api path and device | Back-end cost per stage. Carries the Type A API-path comparison when traces are sampled off |
+| `qfw.qpm.duration` | histogram | `qfw.qpm.op` = `receive` \| `transpile` \| `queue` \| `dispatch`; `receive` also carries `qfw.qpm.request` = `async_run` \| `sync_run`, because a synchronous request spans the whole run | Framework overhead attribution per QPM stage, without depending on trace sampling |
+| `qfw.backend.duration` | histogram | `qfw.backend.op` = `execute` \| `acquire` \| `submit` \| `collect`, plus api path, device, backend kind and outcome | Back-end cost per stage, and `execute` for the whole interaction so a dashboard needs no sum. Carries the Type A API-path comparison when traces are sampled off |
 | `qfw.transport.rpc.duration`, `qfw.transport.rpc.bytes` | histogram | `qfw.transport.kind` | Transport characterization (libfabric work). Optional extension, off by default |
 
 Two conventions hold for this set. Metric names mirror the span they
@@ -910,6 +910,19 @@ Phases 2 to 5 stay on the roadmap and none of them gates production. They
 are sequenced after remediation rather than alongside it, so that the
 benchmarking surface does not grow while the overhead it would measure is
 still there.
+
+**Status, October 2026.** The Phase 1 instrumentation is in the tree:
+`qfw.app.job` and `qfw.app.prepare` in the Qiskit client, `qfw.qpm.receive`,
+`qfw.qpm.queue` and `qfw.qpm.dispatch` in the QPM, `qfw.backend.execute` in
+every run queue, and `qfw.qpm.transpile` with the `acquire`, `submit` and
+`collect` phases in the QRMI, QDMI and native IQM drivers, each with the
+histogram the tables above name. The conventions layer the call sites use is
+`services/util/instrumentation.py`; `backends/qfw_telemetry/` stays the
+provider bootstrap. One sequencing change: the collector-profile reference
+deployment from Phase 4 comes next, ahead of `qfw_bench_extract`, because a
+live dashboard of a running deployment is wanted before an archival report
+is. The overhead budget this phase's exit criterion asks for is still to be
+measured on the instrumented tree.
 
 ## Open Questions and Community Input
 

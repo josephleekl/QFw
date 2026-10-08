@@ -8,6 +8,7 @@ from .descriptor import resolve_descriptor
 from .frontend import Frontend
 from .drivers.qrmi_driver import QrmiDriver
 from .drivers.qdmi_driver import QdmiDriver
+from util import instrumentation
 import logging
 import threading
 import time
@@ -62,6 +63,16 @@ class QRC:
 				for name in descriptor.get("libraries", [])
 				if name in _DRIVER_FACTORY]
 		self.frontend = Frontend(drivers, descriptor)
+		self._descriptor = descriptor
+
+	def _api_path(self, lib):
+		# The library the Frontend will route this run to, which is the
+		# qfw.stack.api_path of its telemetry. The routing error itself, if
+		# any, is the run's to raise.
+		try:
+			return self.frontend.route("run_circuit", lib=lib).name
+		except Exception:
+			return "shim"
 
 	def _result_dict(self, circ, output, rc):
 		return {
@@ -95,11 +106,15 @@ class QRC:
 
 	def _run_circuit(self, circ, raise_on_error):
 		try:
-			circ.set_launching()
-			circ.set_running()
-			output = self.frontend.run_circuit(
-				circ, lib=circ.info.get("lib"))
-			circ.set_exec_done()
+			lib = circ.info.get("lib")
+			with instrumentation.backend_execution(
+					circ, api_path=self._api_path(lib),
+					device=self._descriptor.get("id"),
+					backend_kind=self._descriptor.get("provider")):
+				circ.set_launching()
+				circ.set_running()
+				output = self.frontend.run_circuit(circ, lib=lib)
+				circ.set_exec_done()
 			return self._result_dict(circ, _result_envelope(output), 0)
 		except Exception as e:
 			circ.set_fail()
