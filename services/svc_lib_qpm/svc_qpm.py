@@ -9,14 +9,34 @@ MAX_SHIM_QUBITS = 1024
 MAX_SHIM_SHOTS = 10000
 
 
+def _technology(descriptor):
+	# The qhw technology family the resource's device belongs to, for the
+	# directory record. A Braket device says so in its ARN; the IQM and IBM
+	# devices the shim serves are superconducting.
+	provider = str(descriptor.get("provider") or "").lower()
+	if provider == "aws":
+		from util.braket_transcode import technology_for_arn
+		return technology_for_arn(descriptor.get("provider_device_id"))
+	if provider in ("iqm", "ibm"):
+		return "superconducting"
+	return None
+
+
 class QPM(UTIL_QPM):
 	def __init__(self, start=True):
 		super().__init__(QRC(start=start), max_ppn=1, start=start)
 		set_max_qubits_pp(MAX_SHIM_QUBITS)
 		self.configure_device_profile(
 			max_qubits=MAX_SHIM_QUBITS,
-			max_shots=MAX_SHIM_SHOTS,
+			max_shots=self._max_shots(),
 			time_span_ns=60_000_000_000)
+
+	def _max_shots(self):
+		# A device-access max-shots is what this service admits and what the
+		# Braket profile refuses above; the shim's own ceiling otherwise.
+		from .descriptor import resolve_descriptor
+		value = resolve_descriptor().get("max_shots")
+		return int(value) if value not in (None, "") else MAX_SHIM_SHOTS
 
 	def query(self):
 		from . import SERVICE_NAME, SERVICE_DESC, svc_info
@@ -39,6 +59,21 @@ class QPM(UTIL_QPM):
 			formats = properties.get("circuit_formats", [])
 			properties["circuit_formats"] = [
 				f for f in formats if f != OPENQASM2]
+		# The directory record's `provider` stays 'shim', which is how clients
+		# find a shim service. The resource's own provider and technology ride
+		# beside it, and a device whose library does not say up front (the
+		# record is built before any session opens) takes its qubit count
+		# from device-access config. QPMCapability has no bits for a
+		# simulator or a trapped-ion device, so the capability bits stay as
+		# they are; `technology` is where that reads.
+		provider = str(descriptor.get("provider") or "").lower()
+		if provider:
+			properties["device_provider"] = provider
+		technology = _technology(descriptor)
+		if technology:
+			properties["technology"] = technology
+		if descriptor.get("num_qubits") not in (None, ""):
+			properties["num_qubits"] = int(descriptor["num_qubits"])
 		info = self.query_helper(
 			QPMType.QPM_TYPE_HARDWARE,
 			QPMCapability.QPM_CAP_SUPERCONDUCTING,
