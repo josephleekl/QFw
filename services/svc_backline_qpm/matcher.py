@@ -172,7 +172,7 @@ def _match_on(inventory, transport, ctrls, wanted, code, limit, qubit_count,
 					     f"coprocessor {i}: no decoder meets {limit} us")
 		options.append(opts)
 
-	# ponytail: greedy, first free choice per role; can miss a fit when
+	# Greedy, first free choice per role; can miss a fit when
 	# interchangeable coprocessors differ in reach. Bipartite matching if
 	# inventories grow.
 	taken = set(busy)

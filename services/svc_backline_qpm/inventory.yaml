@@ -25,4 +25,3 @@ decoder:
     hardware: cpu
     symbol: steane_coprocessor
     lib: ${CATALYST_LIB}/libsteane_coprocessor_cpu.so
-    # round_trip_us_p50 unset: memcpy is not measured

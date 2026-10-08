@@ -22,7 +22,7 @@ DEFAULT_INVENTORY = Path(__file__).with_name("inventory.yaml")
 MAX_QUBITS = 3
 
 def backline_profile(device_id, max_qubits):
-	# Admission timing model. ponytail: placeholder costs from the fake IQM
+	# Admission timing model: placeholder costs from the fake IQM
 	# profile; replace with measured compile and QEC-round times.
 	return {
 		"device_id": device_id,
@@ -58,7 +58,7 @@ def backline_profile(device_id, max_qubits):
 def _active(reservation):
 	# The controller closes expired reservations only on the execution path,
 	# which this client-executed QPM never sees, so check the deadline here.
-	# ponytail: admission capacity of an expired, unreleased reservation is
+	# Admission capacity of an expired, unreleased reservation is
 	# returned only when the controller next closes it; placement frees now.
 	expires_at_ns = reservation.get("expires_at_ns")
 	return reservation.get("state") == "active" and not (
