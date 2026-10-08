@@ -38,7 +38,7 @@ QFW_TELEMETRY            off | file | otlp        (default: off)
 QFW_TELEMETRY_DIR        export directory for the file profile
 QFW_TELEMETRY_SAMPLE     off | always | <ratio>   (default: off)
 QFW_TELEMETRY_TRANSPORT  0 | 1                    (default: 0)
-QFW_TELEMETRY_ENDPOINT   collector endpoint for the otlp profile
+QFW_TELEMETRY_ENDPOINT   the collector's OTLP/HTTP base URL, otlp profile
 """
 
 import logging
@@ -268,16 +268,33 @@ def _file_span_processor(service_name):
 	return BatchSpanProcessor(OtlpJsonFileSpanExporter(stream))
 
 
+def _otlp_endpoint(signal_path):
+	"""
+	The OTLP/HTTP URL for one signal, from QFW_TELEMETRY_ENDPOINT, or None
+	to let the exporter read the standard OTEL_EXPORTER_OTLP_* variables.
+
+	The variable names the collector, http://host:4318, the way
+	OTEL_EXPORTER_OTLP_ENDPOINT does, and the signal's path is appended
+	here. An explicit endpoint handed to the exporter is used verbatim, so
+	without this step the collector would answer 404 to every export. A
+	value that already ends in the signal's path is used as given.
+	"""
+	endpoint = _env(TELEMETRY_ENDPOINT_ENV)
+	if not endpoint:
+		return None
+	base = endpoint.rstrip("/")
+	if base.endswith("/" + signal_path):
+		return base
+	return f"{base}/{signal_path}"
+
+
 def _otlp_span_processor():
 	from opentelemetry.sdk.trace.export import BatchSpanProcessor
 	from opentelemetry.exporter.otlp.proto.http.trace_exporter import (
 		OTLPSpanExporter)
 
-	endpoint = _env(TELEMETRY_ENDPOINT_ENV)
-	if endpoint:
-		exporter = OTLPSpanExporter(endpoint=endpoint)
-	else:
-		exporter = OTLPSpanExporter()
+	# endpoint=None hands the choice to the exporter's own environment.
+	exporter = OTLPSpanExporter(endpoint=_otlp_endpoint("v1/traces"))
 	return BatchSpanProcessor(exporter)
 
 
@@ -303,11 +320,8 @@ def _build_metric_reader(service_name, profile):
 		from opentelemetry.exporter.otlp.proto.http.metric_exporter import (
 			OTLPMetricExporter)
 
-		endpoint = _env(TELEMETRY_ENDPOINT_ENV)
-		if endpoint:
-			exporter = OTLPMetricExporter(endpoint=endpoint)
-		else:
-			exporter = OTLPMetricExporter()
+		exporter = OTLPMetricExporter(
+			endpoint=_otlp_endpoint("v1/metrics"))
 	else:
 		from ._otlp_json import OtlpJsonFileMetricExporter
 

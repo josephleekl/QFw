@@ -63,7 +63,7 @@ change and never a code change.
 | `QFW_TELEMETRY_SAMPLE` | `off`, `always`, ratio | `off` | Trace sampling |
 | `QFW_TELEMETRY_DIR` | path | node-local tmp | Export directory, file profile |
 | `QFW_TELEMETRY_TRANSPORT` | `0`, `1` | `0` | DEFw RPC spans |
-| `QFW_TELEMETRY_ENDPOINT` | URL | SDK default | Collector, otlp profile |
+| `QFW_TELEMETRY_ENDPOINT` | URL | SDK default | The collector's OTLP/HTTP base URL for the otlp profile, such as `http://otel-collector:4318`; the signal paths are appended. Unset, the exporters read the standard `OTEL_EXPORTER_OTLP_*` variables |
 | `OTEL_METRIC_EXPORT_INTERVAL` | milliseconds | `10000` | How often metrics export. The SDK's own default is a minute; ten seconds suits a dashboard and bounds what a killed service loses |
 
 Two behaviours are deliberate:
