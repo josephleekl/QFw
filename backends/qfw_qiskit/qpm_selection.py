@@ -14,6 +14,11 @@ QPM_PROVIDER_SELECTIONS = {
 		"qpm_type": QPMType.QPM_TYPE_HARDWARE,
 		"qpm_capabilities": QPMCapability.QPM_CAP_SUPERCONDUCTING,
 	},
+	"backline": {
+		"provider": "backline",
+		"qpm_type": QPMType.QPM_TYPE_SIMULATOR,
+		"qpm_capabilities": QPMCapability.QPM_CAP_STATEVECTOR,
+	},
 	"shim": {
 		"provider": "shim",
 		"qpm_type": QPMType.QPM_TYPE_HARDWARE,
