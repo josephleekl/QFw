@@ -18,6 +18,7 @@ summary is the usual qfw-example-result-v1 record at the end.
 """
 import argparse
 import random
+import resource
 import statistics
 import sys
 import threading
@@ -107,8 +108,14 @@ def qfw_backend_factory(backend_name):
 	return factory
 
 
-def summarize(records, started, ended):
-	"""The metrics of a run: counts, latency quantiles and throughput."""
+def process_cpu_seconds():
+	"""This process's user plus system CPU time so far, for a cost per job."""
+	usage = resource.getrusage(resource.RUSAGE_SELF)
+	return usage.ru_utime + usage.ru_stime
+
+
+def summarize(records, started, ended, cpu_seconds=None):
+	"""The metrics of a run: counts, latency quantiles, throughput and CPU."""
 	elapsed = max(ended - started, 1e-9)
 	latencies = sorted(
 		r["seconds"] for r in records if r["outcome"] == OUTCOME_COMPLETED)
@@ -138,6 +145,9 @@ def summarize(records, started, ended):
 			"max": latencies[-1] if latencies else None,
 		},
 		"by_kind": by_kind,
+		"process_cpu_seconds": cpu_seconds,
+		"process_cpu_seconds_per_job": (
+			cpu_seconds / len(records) if cpu_seconds is not None and records else None),
 	}
 
 
@@ -324,11 +334,15 @@ def main(argv=None, backend_factory=None, run_options=None,
 	print(f"{PROGRESS_PREFIX} start backend={args.backend} jobs={args.jobs or 'until-duration'} "
 		f"duration={args.duration or 'none'} interval={args.interval} workers={args.workers} "
 		f"qubits={args.qubits} shots={args.shots} circuits={','.join(args.kinds)} seed={args.seed}")
+	cpu_before = process_cpu_seconds()
 	records, started, ended = run_stream(
 		backend_factory, run_options, args.kinds, args.qubit_range, args.shots,
 		args.jobs, args.duration, args.interval, args.workers, args.seed,
 		args.stop_on_error, circuit_factory=circuit_factory)
-	metrics = summarize(records, started, ended)
+	# The client's own CPU over the stream, backends and all, which is the
+	# other half of what instrumentation can cost.
+	metrics = summarize(records, started, ended,
+		cpu_seconds=process_cpu_seconds() - cpu_before)
 	ok = metrics["failed"] == 0 or (args.tolerate_failures and metrics["completed"] > 0)
 	emit_result(
 		EXAMPLE,

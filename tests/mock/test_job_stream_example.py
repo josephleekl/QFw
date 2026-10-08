@@ -177,7 +177,10 @@ def test_summary_has_counts_quantiles_and_throughput():
 		"ghz": {"completed": 5, "failed": 0},
 		"random": {"completed": 0, "failed": 1},
 	}
+	assert metrics["process_cpu_seconds"] is None
 	assert stream.summarize([], 0.0, 1.0)["latency_seconds"]["p50"] is None
+	with_cpu = stream.summarize(records, 0.0, 30.0, cpu_seconds=0.3)
+	assert math.isclose(with_cpu["process_cpu_seconds_per_job"], 0.05)
 
 
 def test_main_emits_the_example_record_and_exit_status(capsys, tmp_path, monkeypatch):
@@ -194,6 +197,8 @@ def test_main_emits_the_example_record_and_exit_status(capsys, tmp_path, monkeyp
 	assert record["example"] == "job-stream"
 	assert record["status"] == "error"
 	assert record["metrics"]["completed"] == 2 and record["metrics"]["failed"] == 2
+	assert record["metrics"]["process_cpu_seconds"] >= 0.0
+	assert record["metrics"]["process_cpu_seconds_per_job"] >= 0.0
 	assert record["parameters"]["seed"] == 2
 	assert len(record["details"]["jobs"]) == 4
 	out = capsys.readouterr().out
