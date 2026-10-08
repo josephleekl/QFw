@@ -221,6 +221,7 @@ class UTIL_QPM:
 			self.circuits[cid].set_ready()
 		instrumentation.bind_circuit(
 			self.circuits[cid], qtask_id=runtime.qtask_id)
+		runtime.trace_context = getattr(self.circuits[cid], "otel_context", None)
 		logging.debug(
 			f"{cid} qtask {runtime.qtask_id} added to circuit database "
 			f"in {time.time() - start}")

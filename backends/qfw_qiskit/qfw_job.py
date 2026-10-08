@@ -90,13 +90,20 @@ class QFwJob(Job):
 
 		try:
 			context = self._execution_context()
-			response = self._qpm.async_run(info, **context)
+			with instrumentation.transport_rpc(
+					instrumentation.TRANSPORT_OP_SUBMIT,
+					labels=self._job_labels()):
+				response = self._qpm.async_run(info, **context)
 			cid = _async_response_cid(response)
 			return cid
 		except Exception as e:
 			output = {"Error": str(e), "counts": {"error": str(e)}, "statevector": [str(e)], "memory": []}
 			logging.defw_app(f"Error occurred: {output}")
 			raise e
+
+	def _job_labels(self):
+		# The device and backend kind the job's own metrics carry.
+		return dict(getattr(self._telemetry, "labels", None) or {})
 
 	def _declared_properties(self):
 		# What the QPM published about itself in the directory. The resolver
@@ -165,6 +172,8 @@ class QFwJob(Job):
 					if cid not in expected_cids or cid in completed_cids:
 						continue
 					results.append(event)
+					instrumentation.record_transport_return(
+						payload, labels=self._job_labels())
 					completed_cids.add(cid)
 					total_circuits_completed += 1
 

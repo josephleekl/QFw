@@ -57,12 +57,16 @@ SPAN_QPM_TRANSPILE = "qfw.qpm.transpile"
 SPAN_QPM_QUEUE = "qfw.qpm.queue"
 SPAN_QPM_DISPATCH = "qfw.qpm.dispatch"
 SPAN_BACKEND_EXECUTE = "qfw.backend.execute"
+# The transport extension, flag-guarded: see the end of this module.
+SPAN_TRANSPORT_RPC = "qfw.transport.rpc"
+SPAN_TRANSPORT_RETURN = "qfw.transport.return"
 
 # Metric names. Each mirrors the span it aggregates.
 METRIC_APP_JOB_DURATION = "qfw.app.job.duration"
 METRIC_APP_JOB_COUNT = "qfw.app.job.count"
 METRIC_QPM_DURATION = "qfw.qpm.duration"
 METRIC_BACKEND_DURATION = "qfw.backend.duration"
+METRIC_TRANSPORT_DURATION = "qfw.transport.duration"
 
 # Dimensional attributes: bounded value sets, allowed as metric labels.
 ATTR_API_PATH = "qfw.stack.api_path"
@@ -72,6 +76,7 @@ ATTR_QPM_OP = "qfw.qpm.op"
 ATTR_QPM_REQUEST = "qfw.qpm.request"
 ATTR_BACKEND_OP = "qfw.backend.op"
 ATTR_OUTCOME = "qfw.outcome"
+ATTR_TRANSPORT_OP = "qfw.transport.op"
 ATTR_NUM_QUBITS = "qfw.circuit.num_qubits"
 
 # Descriptive attributes: per-job values, on spans only, never metric labels.
@@ -96,6 +101,10 @@ API_PATH_SIMULATOR = "simulator"
 OUTCOME_COMPLETED = "completed"
 OUTCOME_FAILED = "failed"
 OUTCOME_CANCELLED = "cancelled"
+
+TRANSPORT_OP_SUBMIT = "submit"
+TRANSPORT_OP_EVENT = "event"
+TRANSPORT_OP_RETURN = "return"
 
 _SERVICE_NAMES = {"qpm": "qfw-qpm", "client": "qfw-client"}
 _LOG = logging.getLogger(__name__)
@@ -609,3 +618,88 @@ def describe_payload(span, info):
 		_set(span, {ATTR_CIRCUIT_FORMAT: fmt, ATTR_PAYLOAD_BYTES: size})
 	except Exception as exc:
 		_LOG.debug("payload not described: %s", exc)
+
+
+# --- the transport extension ---------------------------------------------
+#
+# The job-path spans above measure what the two processes do. What they
+# leave out is the transport between them, and on a fast job that is most
+# of the client's time: the run RPC on the way in, the completion event on
+# the way back. These call sites close that gap. They are the design's
+# optional transport extension and are flag-guarded by
+# QFW_TELEMETRY_TRANSPORT rather than sampled, because a sampled-out span
+# still runs its call site.
+
+def transport_enabled():
+	"""True when the transport call sites should run at all."""
+	return enabled() and _telemetry.transport_spans_enabled()
+
+
+@contextlib.contextmanager
+def transport_rpc(op, context=None, labels=None):
+	"""
+	qfw.transport.rpc around one RPC the job path makes: op "submit" for
+	the client's run request, "event" for the QPM's completion-event push.
+	The span joins the current context, or the one given, so a push made
+	from a run-queue thread still lands in the job's trace. A client passes
+	its job's dimensional labels, so its series carry the device like the
+	QPM's do from its resource.
+	"""
+	if not transport_enabled():
+		yield None
+		return
+	labels = dict(labels or {})
+	labels[ATTR_TRANSPORT_OP] = op
+	started = time.monotonic()
+	outcome = OUTCOME_COMPLETED
+	with _telemetry.tracer().start_as_current_span(
+			SPAN_TRANSPORT_RPC, context=context, record_exception=False,
+			set_status_on_exception=False) as span:
+		_set(span, labels)
+		try:
+			yield span
+		except BaseException as error:
+			outcome = OUTCOME_FAILED
+			_mark_error(span, error)
+			raise
+		finally:
+			_set(span, {ATTR_OUTCOME: outcome})
+			values = dict(labels)
+			values[ATTR_OUTCOME] = outcome
+			_record(METRIC_TRANSPORT_DURATION, time.monotonic() - started,
+				values)
+
+
+def record_transport_return(result, received_s=None, labels=None):
+	"""
+	qfw.transport.return, written after the fact on the client: from the
+	provider's completion of a circuit, the completion_time its result
+	carries, to the moment the client picked the completion event up. That
+	is the whole way back: the QRC's result assembly, the QPM's publish, the
+	event RPC and the client's wake-up.
+
+	The two ends are read on two clocks, so the window is skipped unless it
+	is non-negative. On one host the clocks agree; across hosts the number
+	is only as good as their synchronisation.
+	"""
+	if not transport_enabled() or not isinstance(result, dict):
+		return
+	completed_s = (
+		result.get("completion_time") or result.get("cq_enqueue_time"))
+	received_s = time.time() if received_s is None else received_s
+	if not _window(completed_s, received_s):
+		return
+	values = dict(labels or {})
+	values[ATTR_TRANSPORT_OP] = TRANSPORT_OP_RETURN
+	_record(METRIC_TRANSPORT_DURATION, received_s - completed_s, values)
+	try:
+		span = _telemetry.tracer().start_span(
+			SPAN_TRANSPORT_RETURN, start_time=_ns(completed_s))
+		_set(span, {
+			ATTR_TRANSPORT_OP: TRANSPORT_OP_RETURN,
+			ATTR_CID: _text(result.get("cid")),
+			ATTR_QTASK_ID: _text(result.get("qtask_id")),
+		})
+		span.end(end_time=_ns(received_s))
+	except Exception as exc:
+		_LOG.debug("%s not recorded: %s", SPAN_TRANSPORT_RETURN, exc)
